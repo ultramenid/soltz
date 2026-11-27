@@ -290,32 +290,80 @@ enum Smoke {
         check("another host's tab shows with both hosts' sessions still alive",
               switched && workspace.shown == nil && workspace.sessions[stand.id]?.isAttached == true && workspace.sessions[local.id] != nil
                   && !stand.ended && workspace.homeGroups().flatMap(\.rows).count == 3, "")
-        // A session dragged from the sidebar onto the main panel: the drop is sent to the window as AppKit would send
-        // it, at the middle of the pane's terminal (which takes dropped text for itself).
+        // A session dragged from the sidebar onto a pane: a drop the system itself makes (`SystemDrop`), right of the
+        // middle of the pane's terminal (which takes dropped text for itself).
         workspace.show(Workspace.thisMac)
         try? await Task.sleep(for: .milliseconds(300))
         func terminals(_ view: NSView) -> [NSView] {
             (view.registeredDraggedTypes.contains(.string) ? [view] : []) + view.subviews.flatMap(terminals)
         }
-        let dragBoard = NSPasteboard.withUniqueName()
-        dragBoard.clearContents()
-        dragBoard.setData((try? JSONEncoder().encode(Dragged(kind: .session, id: local.id))) ?? Data(), forType: Dragged.pasteboardType)
-        var dropped = (taker: "no terminal", taken: false)
-        if let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "main" }),
-           let terminal = window.contentView.map(terminals)?.first {
-            dropped = StagedDrop.send(dragBoard, at: terminal.convert(CGPoint(x: terminal.bounds.midX, y: terminal.bounds.midY), to: nil), in: window)
+        let main = NSApp.windows.first { $0.identifier?.rawValue == "main" }
+        func onTerminal() -> NSPoint? {
+            main?.contentView.map(terminals)?.first.map { $0.convert(CGPoint(x: $0.bounds.midX + $0.bounds.width / 4, y: $0.bounds.midY), to: nil) }
         }
-        let landed = await wait(2) { workspace.tabs.count == 3 }
-        dragBoard.releaseGlobally()
-        check("a sidebar session dropped on a terminal pane is taken by the pane, not by the terminal as text, and opens a new tab on its host",
-              dropped.taken && landed && !dropped.taker.contains("Terminal") && workspace.tabs(of: Workspace.thisMac).count == 2
+        var taken = false, clicks = false
+        if let main, let point = onTerminal() {
+            taken = await SystemDrop.send(Dragged(kind: .session, id: local.id), at: point, in: main)
+            // What takes the drop lies over the terminal: a click there still has to reach it.
+            clicks = main.contentView?.superview?.hitTest(point).map { !terminals($0).isEmpty } == true
+        }
+        let landed = await wait(2) { workspace.layout.root?.leaves.count == 2 }
+        check("a sidebar session dropped on a terminal pane is taken by the pane, not by the terminal as text, and opens a new pane beside it in the same tab",
+              taken && clicks && landed && workspace.layout.root?.sessionIds.first == local.id && workspace.dropTarget == nil && workspace.tabs.count == 2
                   && workspace.shown == Workspace.thisMac && workspace.activeSession !== local,
-              "taken by \(dropped.taker): \(dropped.taken), tabs \(workspace.tabs.count)")
+              "taken \(taken), a click reaches the terminal \(clicks), tabs \(workspace.tabs.count), panes \(workspace.layout.root?.leaves.count ?? 0) (the pointer has to be under the top quarter of the screen)")
+        if let pane = workspace.activeSession, pane !== local { workspace.close(pane.id) }
+        check("the same row dropped on the tabs opens a new tab",
+              workspace.dropped(Dragged(kind: .session, id: local.id), before: nil) && workspace.tabs.count == 3 && workspace.layout.root?.leaves.count == 1, "")
         let strip = workspace.tabs.map(\.id)
         let first = strip.count == 3 && workspace.dropped(Dragged(kind: .tab, id: strip[2]), before: strip[0])
             && workspace.tabs.map(\.id) == [strip[2], strip[0], strip[1]]
         check("a tab dragged onto another takes its place in the strip, hosts mixed; dropped at the strip's end it goes last",
               first && workspace.dropped(Dragged(kind: .tab, id: strip[2]), before: nil) && workspace.tabs.map(\.id) == strip, "")
+        // A tab from the strip dropped on the pane on screen (the new tab's): it joins it, and leaves the strip.
+        try? await Task.sleep(for: .milliseconds(300))
+        var joined = false
+        if let main, let point = onTerminal(), let tab = workspace.tabs.first(where: { $0.root.sessionIds == [local.id] }) {
+            joined = await SystemDrop.send(Dragged(kind: .tab, id: tab.id), at: point, in: main)
+        }
+        check("a tab dropped on a pane joins it as a pane and leaves the strip; the tab on screen cannot be dropped on itself",
+              joined && workspace.tabs.count == 2 && workspace.layout.root?.sessionIds.contains(local.id) == true && workspace.layout.root?.leaves.count == 2
+                  && workspace.layout.activeSplitTabId.map { !workspace.lands(Dragged(kind: .tab, id: $0), on: local.id) } == true,
+              "taken \(joined), tabs \(workspace.tabs.count), panes \(workspace.layout.root?.leaves.count ?? 0)")
+        // A pane dragged by its header onto another moves there; floated, it is over the panel, listed under
+        // its host all the same, until it is brought back.
+        var moved = false
+        let panes = workspace.layout.root?.sessionIds ?? []
+        if let main, panes.count == 2, let point = onTerminal() {
+            // The point is in the first pane's terminal; the second pane is dropped on its right half.
+            moved = await SystemDrop.send(Dragged(kind: .pane, id: panes[1]), at: point, in: main)
+        }
+        check("a pane dropped on another moves beside it, and cannot be dropped on itself",
+              moved && workspace.layout.root?.leaves.count == 2 && workspace.tabs.count == 2 && !workspace.lands(Dragged(kind: .pane, id: panes[0]), on: panes[0]),
+              "taken \(moved), panes \(workspace.layout.root?.leaves.count ?? 0)")
+        workspace.float(local.id)
+        try? await Task.sleep(for: .milliseconds(300))
+        let floats = workspace.floating == [local.id] && workspace.layout.root?.leaves.count == 1 && workspace.sessions(of: Workspace.thisMac).contains { $0 === local }
+            && !local.ended && main?.contentView.map(terminals)?.count == 2
+        // Minimized, its card gives way to a capsule and its terminal leaves the screen; a click's action brings both back.
+        workspace.setMinimized(local.id, true)
+        try? await Task.sleep(for: .milliseconds(300))
+        let capsule = workspace.minimized == [local.id] && workspace.floating == [local.id] && main?.contentView.map(terminals)?.count == 1
+        workspace.setMinimized(local.id, false)
+        try? await Task.sleep(for: .milliseconds(300))
+        check("a floating pane minimizes to a capsule and comes back to its card, still open",
+              capsule && workspace.minimized.isEmpty && main?.contentView.map(terminals)?.count == 2 && !local.ended, "minimized \(capsule)")
+        // Its header dropped on the middle of the pane left in the tab (the larger terminal's): they change places.
+        let stayed = workspace.layout.root?.sessionIds.first ?? ""
+        var swapped = false
+        if let main, let large = main.contentView.map(terminals)?.max(by: { $0.bounds.width * $0.bounds.height < $1.bounds.width * $1.bounds.height }) {
+            swapped = await SystemDrop.send(Dragged(kind: .pane, id: local.id), at: large.convert(CGPoint(x: large.bounds.midX, y: large.bounds.midY), to: nil), in: main)
+        }
+        check("a floating pane dropped on the middle of a pane takes its place, and that pane floats in its stead",
+              swapped && workspace.layout.root?.sessionIds == [local.id] && workspace.floating == [stayed], "taken \(swapped), floating \(workspace.floating.count)")
+        workspace.restore(stayed)
+        check("a floated pane leaves its tab for a card over the panel, its terminal still on screen and its session listed; it comes back as a pane",
+              floats && workspace.floating.isEmpty && workspace.layout.root?.leaves.count == 2 && workspace.activeSession?.id == stayed, "floated \(floats)")
         workspace.closeAll()
 
         // The New host card's Connect: saved as the full editor saves a host, then connected (no login typed: the prompt).
@@ -477,20 +525,16 @@ enum Smoke {
               tables().map { "\($0.numberOfRows) rows" }.joined(separator: ", "))
 
         // A sidebar row dropped on the files pane's list (an AppKit table, which takes dropped files for itself)
-        // opens a new tab as it does over a terminal; the files tab is shown again for what follows.
+        // opens a pane beside it as it does over a terminal; that pane is closed again for what follows.
         let filesPane = workspace.activeSession, tabCount = workspace.tabs.count
-        let rowBoard = NSPasteboard.withUniqueName()
-        rowBoard.clearContents()
-        rowBoard.setData((try? JSONEncoder().encode(Dragged(kind: .host, id: Workspace.thisMac))) ?? Data(), forType: Dragged.pasteboardType)
-        var onList = (taker: "no list", taken: false)
-        if let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "main" }), let table = tables().first(where: { $0.numberOfRows == 2 }) {
-            onList = StagedDrop.send(rowBoard, at: table.convert(CGPoint(x: table.bounds.midX, y: table.bounds.midY), to: nil), in: window)
+        var onList = false
+        if let main = NSApp.windows.first(where: { $0.identifier?.rawValue == "main" }), let table = tables().first(where: { $0.numberOfRows == 2 }) {
+            onList = await SystemDrop.send(Dragged(kind: .host, id: Workspace.thisMac), at: table.convert(CGPoint(x: table.bounds.midX, y: table.bounds.midY), to: nil), in: main)
         }
-        let newTab = await wait(2) { workspace.tabs.count == tabCount + 1 }
-        rowBoard.releaseGlobally()
-        check("a sidebar row dropped on a files pane's list is taken by the pane and opens a new tab",
-              onList.taken && newTab && workspace.activeSession !== filesPane, "taken by \(onList.taker): \(onList.taken)")
-        if let filesPane { workspace.reveal(filesPane.id) }
+        let newPane = await wait(2) { workspace.layout.root?.leaves.count == 2 }
+        check("a sidebar row dropped on a files pane's list is taken by the pane and opens a pane beside it",
+              onList && newPane && workspace.tabs.count == tabCount && workspace.activeSession !== filesPane, "taken \(onList)")
+        if let pane = workspace.activeSession, pane !== filesPane { workspace.close(pane.id) }
 
         let queue = workspace.transfers, local = workspace.fileProvider(for: nil)
         guard let listed = try? await local.list(left), let file = listed.first(where: { $0.name == "hello.txt" }),
@@ -576,46 +620,53 @@ enum Smoke {
     }
 }
 
-/// A drop without a drag: a real drag follows the user's pointer, so a test run cannot make one.
+/// A drop as the system makes it. A real drag follows the pointer, which a test run cannot move: so the window is
+/// moved to put the point under the pointer, a dragging session is begun there, and the button is "let go" by a posted
+/// event. The pasteboard is as SwiftUI writes a `Transferable`: a file promise, with the value's data beside it.
 @MainActor
-private final class StagedDrop: NSObject, @preconcurrency NSDraggingInfo {
-    let draggingPasteboard: NSPasteboard
-    let draggingLocation: NSPoint
-    let draggingDestinationWindow: NSWindow?
-    var draggingFormation = NSDraggingFormation.none
-    var animatesToDestination = false
-    var numberOfValidItemsForDrop = 1
-
-    init(_ pasteboard: NSPasteboard, at point: NSPoint, in window: NSWindow) {
-        (draggingPasteboard, draggingLocation, draggingDestinationWindow) = (pasteboard, point, window)
+private final class SystemDrop: NSObject, NSDraggingSource, @preconcurrency NSFilePromiseProviderDelegate {
+    private final class Promise: NSFilePromiseProvider {
+        var data = Data()
+        override func writableTypes(for pasteboard: NSPasteboard) -> [NSPasteboard.PasteboardType] { super.writableTypes(for: pasteboard) + [Dragged.pasteboardType] }
+        override func pasteboardPropertyList(forType type: NSPasteboard.PasteboardType) -> Any? {
+            type == Dragged.pasteboardType ? data : super.pasteboardPropertyList(forType: type)
+        }
     }
 
-    var draggingSourceOperationMask: NSDragOperation { .every }
-    var draggedImageLocation: NSPoint { draggingLocation }
-    var draggedImage: NSImage? { nil }
-    var draggingSource: Any? { nil }
-    var draggingSequenceNumber: Int { 1 }
-    var springLoadingHighlight: NSSpringLoadingHighlight { .none }
-    func slideDraggedImage(to _: NSPoint) {}
-    override func namesOfPromisedFilesDropped(atDestination _: URL) -> [String]? { nil }
-    func resetSpringLoading() {}
-    func enumerateDraggingItems(options _: NSDraggingItemEnumerationOptions, for _: NSView?, classes _: [AnyClass],
-                                searchOptions _: [NSPasteboard.ReadingOptionKey: Any],
-                                using _: @escaping (NSDraggingItem, Int, UnsafeMutablePointer<ObjCBool>) -> Void) {}
+    private var ended: NSDragOperation?
 
-    /// Sends the drop where AppKit would: to the view under `point`, or the nearest one above it, that takes one of
-    /// the pasteboard's types. Returns that view's class and whether it took the drop.
-    static func send(_ pasteboard: NSPasteboard, at point: NSPoint, in window: NSWindow) -> (taker: String, taken: Bool) {
-        let types = Set(pasteboard.types ?? [])
-        var view = window.contentView?.superview?.hitTest(point)
-        while let candidate = view, types.isDisjoint(with: candidate.registeredDraggedTypes) { view = candidate.superview }
-        guard let view else { return ("no view", false) }
-        let info = StagedDrop(pasteboard, at: point, in: window)
-        guard !view.draggingEntered(info).isEmpty else { return ("\(type(of: view))", false) }
-        _ = view.draggingUpdated(info)
-        let taken = view.prepareForDragOperation(info) && view.performDragOperation(info)
-        view.concludeDragOperation(info)
-        return ("\(type(of: view))", taken)
+    func draggingSession(_: NSDraggingSession, sourceOperationMaskFor _: NSDraggingContext) -> NSDragOperation { .copy }
+    func draggingSession(_: NSDraggingSession, endedAt _: NSPoint, operation: NSDragOperation) { ended = operation }
+    func filePromiseProvider(_: NSFilePromiseProvider, fileNameForType _: String) -> String { "dragged" }
+    func filePromiseProvider(_: NSFilePromiseProvider, writePromiseTo _: URL, completionHandler: @escaping ((any Error)?) -> Void) { completionHandler(nil) }
+
+    /// True when a view took the drop. Tried again when the pointer was moved off meanwhile.
+    static func send(_ drag: Dragged, at point: NSPoint, in window: NSWindow) async -> Bool {
+        guard let view = window.contentView, let data = try? JSONEncoder().encode(drag) else { return false }
+        func mouse(_ type: NSEvent.EventType) -> NSEvent? {
+            NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                               windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)
+        }
+        let level = window.level
+        defer { window.level = level }
+        window.level = .floating
+        for _ in 0..<3 {
+            let pointer = NSEvent.mouseLocation
+            window.setFrameOrigin(NSPoint(x: pointer.x - point.x, y: pointer.y - point.y))
+            window.orderFrontRegardless()
+            try? await Task.sleep(for: .milliseconds(300))
+            let source = SystemDrop(), item = Promise(fileType: Dragged.pasteboardType.rawValue, delegate: source)
+            item.data = data
+            let dragged = NSDraggingItem(pasteboardWriter: item)
+            dragged.setDraggingFrame(NSRect(x: point.x - 8, y: point.y - 8, width: 16, height: 16), contents: NSImage(size: NSSize(width: 16, height: 16)))
+            guard let down = mouse(.leftMouseDragged), let up = mouse(.leftMouseUp) else { return false }
+            view.beginDraggingSession(with: [dragged], event: down, source: source)
+            try? await Task.sleep(for: .milliseconds(300))
+            NSApp.postEvent(up, atStart: false)
+            for _ in 0..<40 where source.ended == nil { try? await Task.sleep(for: .milliseconds(50)) }
+            if source.ended?.isEmpty == false { return true }
+        }
+        return false
     }
 }
 #endif

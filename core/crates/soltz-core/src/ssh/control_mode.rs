@@ -252,6 +252,8 @@ pub enum ReplyKind {
     State,
     History,
     Saved,
+    /// The visible screen with its wrapped lines joined.
+    Joined,
     Visible,
 }
 
@@ -342,6 +344,7 @@ pub fn sync_command(
         format!("capture-pane -p -e -q -a -t {key}"),
         ReplyKind::Saved,
     ));
+    cmds.push((format!("capture-pane -p -e -J -t {key}"), ReplyKind::Joined));
     cmds.push((format!("capture-pane -p -e -t {key}"), ReplyKind::Visible));
     let line: Vec<&str> = cmds.iter().map(|(c, _)| c.trim_end()).collect();
     (
@@ -359,11 +362,16 @@ fn push_row(out: &mut Vec<u8>, row: &[u8]) {
     out.extend_from_slice(b"\x1b[m");
 }
 
+/// `joined` is the visible screen again with tmux's wrapped lines joined. The normal screen is written from it, so
+/// that the terminal wraps those lines itself and can wrap them again when its width changes: written row by row
+/// they stay cut at the width they were captured at. `visible` still says how many rows that is. (Both are taken
+/// at the terminal's own width, so its wrapping is tmux's.)
 pub fn sync_bytes(
     s: &PaneState,
     history: &[Vec<u8>],
     saved: &[Vec<u8>],
     visible: &[Vec<u8>],
+    joined: &[Vec<u8>],
     rows: u32,
 ) -> Vec<u8> {
     let mut out = SYNC_RESET.as_bytes().to_vec();
@@ -372,9 +380,14 @@ pub fn sync_bytes(
     } else {
         history
     };
-    let normal = if s.alternate_on { saved } else { visible };
+    let rows_shown = if s.alternate_on { saved } else { visible };
+    let normal = if s.alternate_on || joined.is_empty() {
+        rows_shown
+    } else {
+        joined
+    };
     let blank = Vec::new();
-    let padding = (s.pane_height.max(rows) as usize).saturating_sub(normal.len());
+    let padding = (s.pane_height.max(rows) as usize).saturating_sub(rows_shown.len());
     let lines = history
         .iter()
         .chain(normal)
@@ -438,6 +451,7 @@ struct Snapshot {
     state: Option<PaneState>,
     history: Vec<Vec<u8>>,
     saved: Vec<Vec<u8>>,
+    joined: Vec<Vec<u8>>,
     replies_left: usize,
 }
 
@@ -573,6 +587,7 @@ impl ControlSession {
             ReplyKind::State => snapshot.state = lines.first().and_then(|l| PaneState::parse(l)),
             ReplyKind::History => snapshot.history = lines,
             ReplyKind::Saved => snapshot.saved = lines,
+            ReplyKind::Joined => snapshot.joined = lines,
             ReplyKind::Visible => {
                 let Some(snapshot) = self.snapshot.take() else {
                     return;
@@ -588,6 +603,7 @@ impl ControlSession {
                             &snapshot.history,
                             &snapshot.saved,
                             &lines,
+                            &snapshot.joined,
                             self.rows,
                         )));
                     }
@@ -907,17 +923,18 @@ mod tests {
             "capture-pane -p -e -J -t soltz_s1 -S -50000 -E -1"
         );
         assert_eq!(cmds[5], "capture-pane -p -e -q -a -t soltz_s1");
-        assert_eq!(cmds[6], "capture-pane -p -e -t soltz_s1");
+        assert_eq!(cmds[6], "capture-pane -p -e -J -t soltz_s1");
+        assert_eq!(cmds[7], "capture-pane -p -e -t soltz_s1");
         use ReplyKind::*;
         assert_eq!(
             kinds,
-            vec![Ignore, Ignore, Ignore, State, History, Saved, Visible]
+            vec![Ignore, Ignore, Ignore, State, History, Saved, Joined, Visible]
         );
         let (bare, bare_kinds) = sync_command("soltz_s1", 80, 24, None);
         assert!(!bare.contains("window-style"));
         assert_eq!(
             bare_kinds,
-            vec![Ignore, Ignore, State, History, Saved, Visible]
+            vec![Ignore, Ignore, State, History, Saved, Joined, Visible]
         );
     }
 
@@ -944,7 +961,7 @@ mod tests {
             cursor_y: 1,
             ..state(2)
         };
-        let bytes = sync_bytes(&s, &rows(&["h1", "h2"]), &[], &rows(&["s1", "s2"]), 2);
+        let bytes = sync_bytes(&s, &rows(&["h1", "h2"]), &[], &rows(&["s1", "s2"]), &[], 2);
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with(SYNC_RESET));
         let body = &text[SYNC_RESET.len()..];
@@ -954,10 +971,23 @@ mod tests {
     }
 
     #[test]
+    fn sync_writes_a_wrapped_line_whole_and_pads_by_the_rows_it_takes() {
+        // Three rows on screen: a line wrapped over two of them, and the prompt.
+        let s = state(4);
+        let visible = rows(&["a long li", "ne", "$ "]);
+        let joined = rows(&["a long line", "$ "]);
+        let text = String::from_utf8(sync_bytes(&s, &[], &[], &visible, &joined, 4)).unwrap();
+        let body = &text[SYNC_RESET.len()..];
+        assert!(body.starts_with("a long line\x1b[m\r\n$ \x1b[m"));
+        // Four rows in all: the line's two, the prompt's, and one of padding. So one line break after the prompt.
+        assert_eq!(body.matches("\r\n").count(), 2);
+    }
+
+    #[test]
     fn sync_ignores_history_when_history_size_is_zero() {
         let s = state(2);
         let text =
-            String::from_utf8(sync_bytes(&s, &rows(&["$ "]), &[], &rows(&["$ ", ""]), 2)).unwrap();
+            String::from_utf8(sync_bytes(&s, &rows(&["$ "]), &[], &rows(&["$ ", ""]), &[], 2)).unwrap();
         assert_eq!(text.matches("$ ").count(), 1);
     }
 
@@ -968,7 +998,7 @@ mod tests {
             ..state(3)
         };
         let text =
-            String::from_utf8(sync_bytes(&s, &rows(&["h"]), &[], &rows(&["$ "]), 3)).unwrap();
+            String::from_utf8(sync_bytes(&s, &rows(&["h"]), &[], &rows(&["$ "]), &[], 3)).unwrap();
         let body = &text[SYNC_RESET.len()..];
         assert_eq!(body.matches("\r\n").count(), 3);
     }
@@ -984,6 +1014,7 @@ mod tests {
             &rows(&["h"]),
             &[],
             &rows(&["a", "b", "c"]),
+            &[],
             5,
         ))
         .unwrap();
@@ -1012,6 +1043,7 @@ mod tests {
             &[],
             &rows(&["n1", "n2"]),
             &rows(&["", "", "", "", "  ALT"]),
+            &rows(&["joined, and not used: the alternate screen is on"]),
             10,
         ))
         .unwrap();
@@ -1036,7 +1068,7 @@ mod tests {
             cursor_y: 4,
             ..state(10)
         };
-        let text = String::from_utf8(sync_bytes(&s, &[], &[], &rows(&[""]), 10)).unwrap();
+        let text = String::from_utf8(sync_bytes(&s, &[], &[], &rows(&[""]), &[], 10)).unwrap();
         assert!(text.ends_with("\x1b[3;8r\x1b[?6h\x1b[3;1H\x1b[?25l"));
     }
 
@@ -1073,6 +1105,7 @@ mod tests {
         replies.extend(begin_end(first + 3, &["old"]));
         replies.extend(begin_end(first + 4, &[]));
         replies.extend(begin_end(first + 5, &["$ ls", "$ "]));
+        replies.extend(begin_end(first + 6, &["$ ls", "$ "]));
         s.on_output(&replies)
     }
 
@@ -1168,7 +1201,14 @@ mod tests {
             .is_empty());
         let actions = finish_sync(&mut s, 2);
         let state = PaneState::parse(STATE_2_ROWS.as_bytes()).unwrap();
-        let expected = sync_bytes(&state, &rows(&["old"]), &[], &rows(&["$ ls", "$ "]), 2);
+        let expected = sync_bytes(
+            &state,
+            &rows(&["old"]),
+            &[],
+            &rows(&["$ ls", "$ "]),
+            &rows(&["$ ls", "$ "]),
+            2,
+        );
         assert_eq!(
             actions,
             vec![
@@ -1239,6 +1279,7 @@ mod tests {
         replies.extend(begin_end(5, &[]));
         replies.extend(begin_end(6, &[]));
         replies.extend(begin_end(7, &["$ "]));
+        replies.extend(begin_end(8, &["$ "]));
         assert_eq!(
             s.on_output(&replies),
             vec![Action::Started {

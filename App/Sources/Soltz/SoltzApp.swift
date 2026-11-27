@@ -197,6 +197,7 @@ struct SoltzCommands: Commands {
                 Button(workspace.layout.maximizedPaneId == nil ? "Maximize Pane" : "Restore Pane") { workspace.toggleMaximize() }
                     .keyboardShortcut(.return, modifiers: [.command, .shift])
                     .disabled((workspace.layout.root?.leaves.count ?? 0) < 2)
+                Button("Float Pane") { if let session = workspace.activeSession { workspace.float(session.id) } }
             }
             .disabled(!inWorkspace)
         }

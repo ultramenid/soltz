@@ -86,5 +86,7 @@ struct FilesPane: View {
     private var title: some View {
         Label(workspace.fileLabel(session), systemImage: TerminalSession.filesSymbol).font(Theme.chromeStrong).lineLimit(1)
             .help("\(workspace.fileLabel(session)) · SFTP")
+            // The pane's handle, as a terminal's header is.
+            .draggable(Dragged(kind: .pane, id: session.id)) { DragChip(title: workspace.fileLabel(session), systemImage: TerminalSession.filesSymbol) }
     }
 }

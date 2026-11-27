@@ -196,6 +196,16 @@ enum Snapshot {
         try? await Task.sleep(for: .milliseconds(600))
         await film("pane-maximizing", window) { workspace.toggleMaximize() }
         workspace.toggleMaximize()
+        // A floating pane: it leaves the split for a card over the panel's corner; minimized, a capsule there.
+        if let pane = workspace.activeSession {
+            try? await Task.sleep(for: .milliseconds(400))
+            await film("pane-floating", window) { workspace.float(pane.id) }
+            await save("floating", window)
+            await film("float-minimizing", window) { workspace.setMinimized(pane.id, true) }
+            await save("floating-minimized", window)
+            workspace.restore(pane.id)
+            try? await Task.sleep(for: .milliseconds(400))
+        }
 
         // 4. A files tab: a host's files in a pane. A local session on a temp folder shaped like the mockup's stands
         // in for the host's.
@@ -231,20 +241,26 @@ enum Snapshot {
         stageFileDrag(window)
         try? await Task.sleep(for: .milliseconds(300))
 
-        // 5. A sidebar row dragged onto the main panel: the panel is where it lands, and it opens a new tab (This
-        // Mac's here, among prod-web-01's).
+        // 5. A sidebar row dragged onto a pane: the half its pane would take is lit, and it opens there (This Mac's
+        // here, beside prod-web-01's).
         if let first {
             workspace.activate(first)
-            workspace.dropTarget = Workspace.panel
-            await save("panel-drop", window)
+            let under = workspace.activeSession?.id ?? ""
+            (workspace.dropTarget, workspace.dropSide) = (Workspace.panel + under, .right)
+            await save("pane-drop", window)
             workspace.dropTarget = nil
-            try? await Task.sleep(for: .milliseconds(400))
-            await film("drop-to-tab", window) { workspace.openTab(for: Dragged(kind: .host, id: Workspace.thisMac)) }
+            await film("drop-to-pane", window) { workspace.openPane(for: Dragged(kind: .host, id: Workspace.thisMac), beside: under, .right) }
             if let guest = workspace.activeSession, await wait(until: { guest.isAttached }) {
                 guest.send(Data("PS1=''; clear; printf 'me@this-mac ~ $ uname\\nDarwin\\n'\n".utf8))
             }
             await save("tabs-of-hosts", window)
         }
+
+        // 6. Many panes: columns of a width, and no more than have room (the fourth opens a tab of its own).
+        workspace.newLocalTerminal()
+        for _ in 0..<3 { workspace.newLocalTerminal(.right) }
+        if let last = workspace.tabs.dropLast().last { workspace.activate(last.id) }
+        await save("panes-many", window, wait: 1.5)
 
         stands.forEach { $0.args = nil } // they close as the local shells they are
         workspace.closeAll()

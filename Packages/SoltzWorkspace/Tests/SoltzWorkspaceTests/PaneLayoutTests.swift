@@ -53,3 +53,24 @@ import Testing
         #expect(dragged.ratio == 0.1)
     }
 }
+
+@Suite struct EqualSplits {
+    @Test func panesSplitTheSameWayShareTheLengthEquallyAndOtherDividersStayWhereTheyWerePut() throws {
+        let store = LayoutStore()
+        store.openSessions(["a"])
+        for id in ["b", "c", "d"] { store.splitPane(try #require(store.activePaneId), id, .right) }
+        let rect = CGRect(x: 0, y: 0, width: 403, height: 300)
+        let widths = PaneLayout(try #require(store.root), in: rect).panes.map(\.frame.width)
+        #expect(widths.count == 4 && (widths.max() ?? 0) - (widths.min() ?? 0) <= 2, "four columns, not a half, a quarter and two eighths: \(widths)")
+
+        store.splitPane(try #require(store.activePaneId), "e", .bottom)
+        let root = try #require(store.root)
+        let stacked = try #require(PaneLayout(root, in: rect).dividers.first { $0.direction == .v })
+        store.setRatio(stacked.splitId, 0.3)
+        store.splitPane(try #require(store.root?.findLeaf(session: "a")?.id), "f", .left)
+        let after = PaneLayout(try #require(store.root), in: rect)
+        #expect(after.dividers.first { $0.splitId == stacked.splitId }?.ratio == 0.3, "a divider of another run is left alone")
+        let columns = Set(after.panes.map(\.frame.minX)).count
+        #expect(columns == 5 && after.panes.allSatisfy { $0.frame.width > 70 }, "five columns of a width")
+    }
+}

@@ -2,6 +2,7 @@
 import AppKit
 import Network
 import Observation
+import os
 import SoltzCore
 import SoltzFilesUI
 import SoltzModel
@@ -12,7 +13,8 @@ import UniformTypeIdentifiers
 /// What is dragged inside the window: a sidebar host or session, or a tab. A type of its own, never text: a terminal
 /// takes dropped text as a paste, and would type the id into its shell.
 struct Dragged: Codable, Transferable {
-    enum Kind: String, Codable { case host, session, tab }
+    /// A host or a session from the sidebar, a tab from the strip, a pane by its header (its session's id).
+    enum Kind: String, Codable { case host, session, tab, pane }
 
     let kind: Kind
     let id: String
@@ -23,8 +25,11 @@ struct Dragged: Codable, Transferable {
     }
 }
 
-/// Where a new session goes: its own tab, or beside / below the active pane.
-enum Placement { case tab, right, below }
+/// Where a new session goes: its own tab, or a new pane on one side of the active one.
+enum Placement: Equatable {
+    case tab, beside(SplitPosition)
+    static let right = beside(.right), below = beside(.bottom)
+}
 
 /// The main window's state: open sessions, their tabs and panes, and the saved hosts (Storage.swift).
 ///
@@ -34,19 +39,31 @@ enum Placement { case tab, right, below }
 @MainActor @Observable
 final class Workspace {
     static let thisMac = "this-mac"
-    /// `dropTarget` over the main panel (a pane's session follows it), and over the end of the tab strip.
+    /// `dropTarget` over a pane of the main panel (its session follows), and over the end of the tab strip.
     static let panel = "panel:", stripEnd = "strip-end"
     let core: Core
     let layout = LayoutStore()
     private(set) var sessions: [String: TerminalSession] = [:]
+    /// Sessions floated out of their tabs: each is in a small card over the main panel, whatever tab is on screen,
+    /// and goes on running.
+    private(set) var floating: [String] = []
+    /// The floating ones minimized: each is a capsule in the corner until it is clicked.
+    private(set) var minimized: Set<String> = []
     /// The host of the tab on screen, a saved host's id or `thisMac`; nil shows none.
     private(set) var shown: String?
     /// Each host's tab shown last, to come back to from another host's.
     @ObservationIgnored private var lastTab: [String: String] = [:]
     var showingSettings = false
     /// What a dragged host, session or tab is over: a sidebar group's id ("" for no group), a tab's key, or the
-    /// main panel (`panel`, then the pane's session).
+    /// pane (`panel`, then the pane's session).
     var dropTarget: String?
+    /// Over a pane: the side of it the new pane would take; none is the whole of it, to change places with.
+    var dropSide: SplitPosition?
+    /// The size the panes of a tab share on screen, for `place` to tell whether one more has room; zero until laid out.
+    @ObservationIgnored var paneArea = CGSize.zero
+    /// What the app's own drags did, for when one does nothing: kinds and outcomes, no names
+    /// (`log show --predicate 'subsystem == "app.soltz"'`).
+    static let drags = Logger(subsystem: "app.soltz", category: "drag")
     var newHost: NewHostForm?
     /// The group being named in its card.
     var naming: GroupNaming?
@@ -109,11 +126,12 @@ final class Workspace {
     }
 
     /// A host's tabs, in strip order.
-    func tabs(of key: String) -> [SplitTab] { tabs.filter { self.key(of: $0) == key } }
+    /// A tab is every host's that has a pane in it.
+    func tabs(of key: String) -> [SplitTab] { tabs.filter { $0.root.sessionIds.contains { self.key(ofSession: $0) == key } } }
 
-    /// A host's sessions, in tab then pane order: what the sidebar lists under it.
+    /// A host's sessions, in tab then pane order, then the floating ones: what the sidebar lists under it.
     func sessions(of key: String) -> [TerminalSession] {
-        tabs.flatMap(\.root.sessionIds).compactMap { sessions[$0] }.filter { self.key(ofSession: $0.id) == key }
+        (tabs.flatMap(\.root.sessionIds) + floating).compactMap { sessions[$0] }.filter { self.key(ofSession: $0.id) == key }
     }
 
     /// Shows a host's tab, the one it showed last; nil, or a host without tabs, shows none. Sessions keep running
@@ -136,8 +154,11 @@ final class Workspace {
         if let tab, let shown { lastTab[shown] = tab.id }
     }
 
-    /// Shows a session picked in the sidebar: its tab and its pane.
+    /// Shows a session picked in the sidebar: its tab and its pane. A floating one comes back among the panes, a
+    /// minimized one to its card.
     func reveal(_ sessionId: String) {
+        if minimized.contains(sessionId) { return setMinimized(sessionId, false) }
+        if floating.contains(sessionId) { return restore(sessionId) }
         guard let tab = layout.splitTabs.first(where: { $0.root.sessionIds.contains(sessionId) }),
               let leaf = tab.root.findLeaf(session: sessionId) else { return }
         layout.activateSplitTab(tab.id)
@@ -147,20 +168,75 @@ final class Workspace {
         focusActive()
     }
 
-    /// A sidebar row dropped on the main panel or on the tabs: new work on that host, so a new tab. A session's drop
-    /// opens another like it (the same host and directory, terminal or files); a host's is its Open.
+    /// Dropped on the tabs, or on the panel while it is empty. A sidebar row is new work on that host, in a new tab;
+    /// a pane, open already, becomes a tab of its own.
     @discardableResult
     func openTab(for drag: Dragged) -> Bool {
+        guard drag.kind == .pane else { return start(drag, .tab) }
+        guard lift(drag.id) else { return false }
+        place(drag.id, .tab)
+        focusActive()
+        return true
+    }
+
+    /// Whether a drop on the pane showing `sessionId` does anything: not the tab on screen's, which is there already,
+    /// nor a pane's on itself.
+    func lands(_ drag: Dragged, on sessionId: String) -> Bool {
+        switch drag.kind {
+        case .host, .session: true
+        case .tab: drag.id != layout.activeSplitTabId && layout.splitTabs.contains { $0.id == drag.id }
+        case .pane: drag.id != sessionId && (floating.contains(drag.id) || layout.splitTabs.contains { $0.root.sessionIds.contains(drag.id) })
+        }
+    }
+
+    /// Dropped on a pane, on the side of it the drop was nearest. A sidebar row is the same new work as on the tabs,
+    /// in a new pane there. What is open already moves there: a pane dragged by its header, and a tab from the
+    /// strip, whose panes move in, each beside the last, as it leaves the strip. So a tab can have panes of several
+    /// hosts.
+    @discardableResult
+    func openPane(for drag: Dragged, beside sessionId: String, _ side: SplitPosition) -> Bool {
+        guard layout.root?.findLeaf(session: sessionId) != nil, lands(drag, on: sessionId) else { return false }
+        let moving: [String]
+        switch drag.kind {
+        case .host, .session:
+            activatePane(of: sessionId)
+            return start(drag, .beside(side))
+        case .pane:
+            guard lift(drag.id) else { return false }
+            moving = [drag.id]
+        case .tab:
+            moving = layout.splitTabs.first { $0.id == drag.id }?.root.sessionIds ?? []
+            layout.closeSplitTab(drag.id)
+        }
+        activatePane(of: sessionId)
+        for id in moving { place(id, .beside(side)) }
+        focusActive()
+        return true
+    }
+
+    /// A pane dropped on the middle of another: the two change places. A floating one takes the pane's place, and
+    /// that pane floats in its stead.
+    @discardableResult
+    func swap(_ drag: Dragged, with sessionId: String) -> Bool {
+        guard drag.kind == .pane, lands(drag, on: sessionId), let target = layout.root?.findLeaf(session: sessionId),
+              layout.swapSession(in: target.id, with: drag.id) != nil else { return false }
+        if let index = floating.firstIndex(of: drag.id) { floating[index] = sessionId }
+        focusActive()
+        return true
+    }
+
+    /// A session's drop opens another like it (the same host and directory, terminal or files); a host's is its Open.
+    private func start(_ drag: Dragged, _ placement: Placement) -> Bool {
         switch drag.kind {
         case .session:
             guard let session = sessions[drag.id] else { return false }
-            duplicate(session, .tab)
+            duplicate(session, placement)
         case .host:
-            if drag.id == Self.thisMac { newLocalTerminal() }
-            else if let host = connections.first(where: { $0.id == drag.id }) { connect(to: host) }
-            else if let left = sessions(of: drag.id).first { duplicate(left, .tab) } // its host was deleted since
+            if drag.id == Self.thisMac { newLocalTerminal(placement) }
+            else if let host = connections.first(where: { $0.id == drag.id }) { connect(to: host, placement) }
+            else if let left = sessions(of: drag.id).first { duplicate(left, placement) } // its host was deleted since
             else { return false }
-        case .tab: return false
+        case .tab, .pane: return false
         }
         return true
     }
@@ -225,7 +301,8 @@ final class Workspace {
         return true
     }
 
-    func closeTab(_ tabId: String) {
+    /// `ending` false leaves its sessions open: they are on their way somewhere else (`lift`).
+    func closeTab(_ tabId: String, ending: Bool = true) {
         guard let tab = layout.splitTabs.first(where: { $0.id == tabId }) else { return }
         // The tab beside it in the strip takes its place on screen: the next one, else the one before.
         let strip = tabs
@@ -233,24 +310,21 @@ final class Workspace {
             (strip.dropFirst(index + 1).first ?? strip.prefix(index).last)?.id
         }
         layout.closeSplitTab(tabId)
-        tab.root.sessionIds.forEach(end)
+        if ending { tab.root.sessionIds.forEach(end) }
         if let beside { layout.activateSplitTab(beside) }
         settle()
         if beside != nil { focusActive() }
     }
 
     func closeAll() {
-        layout.splitTabs.map(\.id).forEach(closeTab)
+        layout.splitTabs.map(\.id).forEach { closeTab($0) }
+        floating.forEach(close)
     }
 
     // MARK: - Panes
 
     func closePane() {
-        guard let tabId = layout.activeSplitTabId, let root = layout.root else { return }
-        guard root.leaves.count > 1 else { return closeTab(tabId) }
-        guard let closed = detachActivePane() else { return }
-        end(closed)
-        focusActive()
+        if let id = layout.root?.findLeaf(layout.activePaneId)?.sessionId { close(id) }
     }
 
     /// Takes the active pane out of its tab, which has others, and returns its session, still open.
@@ -271,19 +345,54 @@ final class Workspace {
         return detached
     }
 
-    /// Closes the pane showing `sessionId`, in whichever tab, as `closePane` closes the active one; the tab shown before
-    /// stays shown.
+    /// Closes the pane showing `sessionId`, floating or in whichever tab; the tab and the pane shown before stay shown.
     func close(_ sessionId: String) {
+        guard lift(sessionId) else { return }
+        end(sessionId)
+        focusActive()
+    }
+
+    /// Takes `sessionId` out of where it shows, still open: from the floating ones, or out of its tab, which closes
+    /// if it was alone in it. The tab shown before stays shown, and the pane that had the keys keeps them.
+    private func lift(_ sessionId: String) -> Bool {
+        if let index = floating.firstIndex(of: sessionId) {
+            floating.remove(at: index)
+            minimized.remove(sessionId)
+            return true
+        }
         guard let tab = layout.splitTabs.first(where: { $0.root.sessionIds.contains(sessionId) }),
-              let leaf = tab.root.findLeaf(session: sessionId) else { return }
+              let leaf = tab.root.findLeaf(session: sessionId) else { return false }
+        guard tab.root.leaves.count > 1 else {
+            closeTab(tab.id, ending: false)
+            return true
+        }
         let before = layout.activeSplitTabId, active = layout.activePaneId
         layout.activateSplitTab(tab.id)
         layout.setActivePane(leaf.id)
-        closePane()
+        detachActivePane()
         if let before, before != tab.id, layout.splitTabs.contains(where: { $0.id == before }) { layout.activateSplitTab(before) }
-        // The pane that had the keys keeps them: closing another one must not move them.
         if let active, active != leaf.id, layout.root?.findLeaf(active) != nil { layout.setActivePane(active) }
         settle()
+        return true
+    }
+
+    /// Floats a pane: out of its tab, into a small card over the main panel.
+    func float(_ sessionId: String) {
+        guard !floating.contains(sessionId), lift(sessionId) else { return }
+        floating.append(sessionId)
+        focusActive()
+    }
+
+    /// A floating pane's card shrinks to a capsule in the corner, or comes back from it.
+    func setMinimized(_ sessionId: String, _ on: Bool) {
+        if on, floating.contains(sessionId) { minimized.insert(sessionId) } else { minimized.remove(sessionId) }
+        if on { focusActive() } else { sessions[sessionId]?.terminal.focus() }
+    }
+
+    /// A floating pane back among the panes: beside the active one of the tab on screen, or in a tab of its own.
+    func restore(_ sessionId: String) {
+        guard floating.contains(sessionId), lift(sessionId) else { return }
+        place(sessionId, shown == nil ? .tab : .right)
         focusActive()
     }
 
@@ -329,14 +438,23 @@ final class Workspace {
         focusActive()
     }
 
+    /// A pane that would leave any pane of the tab under the least size (`Theme.paneLeast`) opens in a tab of its
+    /// own instead.
     func place(_ sessionId: String, _ placement: Placement) {
-        if placement != .tab, let pane = layout.activePaneId, layout.root != nil {
-            layout.splitPane(pane, sessionId, placement == .right ? .right : .bottom)
+        if case .beside(let side) = placement, let pane = layout.activePaneId, let root = layout.root,
+           hasRoom(root.splitting(pane, with: LeafNode(id: "", sessionId: sessionId), side)) {
+            layout.splitPane(pane, sessionId, side)
         } else {
             layout.openSessions([sessionId])
             layout.syncTitlebarOrder(layout.splitTabs.map { Self.key($0.id) })
         }
         follow()
+    }
+
+    private func hasRoom(_ panes: PaneNode) -> Bool {
+        paneArea == .zero || PaneLayout(panes, in: CGRect(origin: .zero, size: paneArea)).panes.allSatisfy {
+            $0.frame.width >= Theme.paneLeast.width && $0.frame.height >= Theme.paneLeast.height
+        }
     }
 
     /// Keystrokes from one terminal, to its own session.

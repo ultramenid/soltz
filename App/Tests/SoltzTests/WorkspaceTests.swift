@@ -131,11 +131,90 @@ import Testing
         #expect(!workspace.dropped(Dragged(kind: .tab, id: "gone"), before: nil) && workspace.tabs.map(\.id) == ids, "a tab closed meanwhile moves nothing")
         #expect(!workspace.openTab(for: Dragged(kind: .session, id: "gone")) && !workspace.openTab(for: Dragged(kind: .host, id: "gone")),
                 "a row whose session or host is gone opens nothing")
+        #expect(!workspace.openPane(for: Dragged(kind: .host, id: Workspace.thisMac), beside: "gone", .right) && workspace.tabs.map(\.id) == ids,
+                "nor does a row dropped on a pane closed meanwhile")
         workspace.activate(ids[1])
         workspace.closeTab(ids[1])
         #expect(workspace.layout.activeSplitTabId == ids[2], "the next tab takes a closed one's place on screen")
         workspace.closeTab(ids[2])
         #expect(workspace.layout.activeSplitTabId == ids[0], "or the one before it, at the strip's end")
+    }
+
+    @Test func aTabDroppedOnAPaneJoinsIt() {
+        let workspace = Workspace()
+        for id in ["a", "b", "c"] { workspace.place(id, .tab) }
+        let ids = workspace.tabs.map(\.id)
+        #expect(!workspace.openPane(for: Dragged(kind: .tab, id: ids[2]), beside: "c", .right) && workspace.tabs.map(\.id) == ids,
+                "the tab on screen, dropped on its own pane, moves nothing")
+        #expect(workspace.openPane(for: Dragged(kind: .tab, id: ids[0]), beside: "c", .left) && workspace.tabs.map(\.id) == [ids[1], ids[2]]
+                    && workspace.layout.root?.sessionIds == ["a", "c"] && workspace.layout.activeSplitTabId == ids[2],
+                "another tab leaves the strip: its pane is beside that one, on the side it was dropped")
+    }
+
+    @Test func aPaneMovesByADropAndAFloatingOneStaysOutUntilItComesBack() {
+        let workspace = Workspace()
+        workspace.place("a", .tab)
+        workspace.place("b", .right)
+        workspace.place("c", .below)
+        let panes = { workspace.layout.root?.sessionIds ?? [] }
+        #expect(workspace.openPane(for: Dragged(kind: .pane, id: "c"), beside: "a", .left) && panes() == ["c", "a", "b"], "a pane dropped on another moves beside it")
+        #expect(!workspace.openPane(for: Dragged(kind: .pane, id: "a"), beside: "a", .left) && panes() == ["c", "a", "b"], "but not on itself")
+        workspace.float("b")
+        #expect(workspace.floating == ["b"] && panes() == ["c", "a"] && workspace.tabs.count == 1, "a floating pane leaves its tab")
+        workspace.float("c")
+        workspace.float("a")
+        #expect(workspace.floating == ["b", "c", "a"] && workspace.tabs.isEmpty && workspace.shown == nil, "the last one takes its tab with it")
+        workspace.restore("b")
+        #expect(workspace.floating == ["c", "a"] && panes() == ["b"] && workspace.shown == Workspace.thisMac, "with no tab on screen it comes back in one of its own")
+        #expect(workspace.openPane(for: Dragged(kind: .pane, id: "c"), beside: "b", .right) && panes() == ["b", "c"] && workspace.floating == ["a"],
+                "a floating pane dropped on a pane goes beside it")
+        #expect(workspace.openTab(for: Dragged(kind: .pane, id: "c")) && workspace.tabs.count == 2 && panes() == ["c"], "a pane dropped on the tabs becomes a tab")
+        workspace.restore("a")
+        #expect(workspace.floating.isEmpty && panes() == ["c", "a"], "and beside the active pane when a tab is on screen")
+        workspace.float("a")
+        workspace.setMinimized("a", true)
+        workspace.setMinimized("c", true)
+        #expect(workspace.minimized == ["a"], "a floating pane minimizes, a pane of a tab does not")
+        workspace.setMinimized("a", false)
+        workspace.setMinimized("a", true)
+        #expect(workspace.minimized == ["a"] && workspace.floating == ["a"], "and comes back, and goes again")
+        workspace.close("a")
+        #expect(workspace.minimized.isEmpty, "closed, it is no longer minimized either")
+        #expect(workspace.floating.isEmpty && panes() == ["c"], "a floating pane closes like any other")
+    }
+
+    @Test func aPaneDroppedOnTheMiddleOfAnotherChangesPlacesWithItAndTabsJoinOneAfterAnother() {
+        let workspace = Workspace()
+        workspace.place("a", .tab)
+        workspace.place("b", .right)
+        workspace.place("c", .below)
+        let panes = { workspace.layout.root?.sessionIds ?? [] }
+        #expect(workspace.swap(Dragged(kind: .pane, id: "c"), with: "a") && panes() == ["c", "b", "a"], "two panes of a tab change places")
+        #expect(!workspace.swap(Dragged(kind: .pane, id: "a"), with: "a") && !workspace.swap(Dragged(kind: .tab, id: "a"), with: "b") && panes() == ["c", "b", "a"],
+                "not a pane with itself, and nothing but a pane")
+        workspace.float("b")
+        #expect(workspace.swap(Dragged(kind: .pane, id: "b"), with: "c") && panes() == ["b", "a"] && workspace.floating == ["c"],
+                "a floating pane takes the pane's place, which floats in its stead")
+        workspace.place("d", .tab)
+        workspace.place("e", .tab)
+        workspace.place("f", .right)
+        let tabs = workspace.tabs.map(\.id)
+        workspace.activate(tabs[0])
+        #expect(workspace.openPane(for: Dragged(kind: .tab, id: tabs[1]), beside: "a", .right) && panes() == ["b", "a", "d"], "a tab joins")
+        #expect(workspace.openPane(for: Dragged(kind: .tab, id: tabs[2]), beside: "b", .bottom) && workspace.tabs.map(\.id) == [tabs[0]]
+                    && Set(panes()) == ["a", "b", "d", "e", "f"], "and then another, both its panes")
+    }
+
+    @Test func aPaneThatWouldLeaveNoRoomOpensInATabOfItsOwn() {
+        let workspace = Workspace()
+        workspace.paneArea = CGSize(width: 600, height: 400)
+        workspace.place("a", .tab)
+        workspace.place("b", .right)
+        #expect(workspace.tabs.count == 1 && workspace.layout.root?.sessionIds == ["a", "b"], "two columns of 300 have room")
+        workspace.place("c", .right)
+        #expect(workspace.tabs.count == 2 && workspace.layout.root?.sessionIds == ["c"], "three of 200 have not: the third is a tab")
+        workspace.place("d", .below)
+        #expect(workspace.layout.root?.sessionIds == ["c", "d"], "and that tab splits as any other")
     }
 
     @Test func closingAnotherPaneLeavesTheKeysWhereTheyWere() {

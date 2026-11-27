@@ -40,6 +40,7 @@ struct ContentView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .animation(Theme.motion, value: workspace.shown)
+            .overlay(alignment: .bottomTrailing) { FloatingPanes() }
         }
         .frame(minWidth: 760, minHeight: 480)
         .toolbar(removing: .title)
@@ -177,7 +178,6 @@ private struct WorkspaceView: View {
 
     var body: some View {
         let showsFiles = workspace.layout.root?.sessionIds.contains { workspace.sessions[$0]?.showsFiles == true } == true
-        let over = workspace.dropTarget?.hasPrefix(Workspace.panel) == true
         VStack(spacing: 0) {
             PaneTreeView(store: workspace.layout, motion: Theme.motion) { sessionId in
                 if let session = workspace.sessions[sessionId] { PaneCard(session: session).transition(Theme.arrival) }
@@ -186,17 +186,7 @@ private struct WorkspaceView: View {
             // divider is not animated, it follows the pointer.
             .animation(Theme.motion, value: workspace.layout.root?.sessionIds)
             .animation(Theme.motion, value: workspace.layout.maximizedPaneId)
-            // A host or a session dragged from the sidebar is new work, so it opens a new tab: the whole panel is
-            // where it lands. (This takes the drop between and on the panes' headers; over a terminal,
-            // `ClickObserving` does.)
-            .dropOutline(over, radius: Theme.paneRadius)
-            .animation(Theme.motion, value: over)
-            .dropDestination(for: Dragged.self) { drags, _ in
-                workspace.dropTarget = nil
-                return drags.first.map(workspace.openTab(for:)) ?? false
-            } isTargeted: { over in
-                if over { workspace.dropTarget = Workspace.panel } else if workspace.dropTarget == Workspace.panel { workspace.dropTarget = nil }
-            }
+            .onGeometryChange(for: CGSize.self) { $0.size } action: { workspace.paneArea = $0 }
             .padding(.horizontal, Theme.paneMargin - Theme.paneGap / 2)
             // Copies to and from the hosts, under the files they are about. (Nothing while there are none.)
             if showsFiles {
@@ -217,25 +207,66 @@ private struct WorkspaceView: View {
     }
 }
 
-/// One pane: a session's terminal in a card with a header (title, directory, split, maximize, close), or its host's
-/// files (`FilesPane`, a card of its own), and the connecting or ended state over either.
-private struct PaneCard: View {
-    let session: TerminalSession
+/// The floating panes: each a small card over the corner of the main panel, above the tabs, whatever tab is on
+/// screen, its session live in it. It goes back among the panes from its button, or dragged there by its header;
+/// minimized, it is a capsule in the same corner, and a click brings its card back.
+private struct FloatingPanes: View {
     @Environment(Workspace.self) private var workspace
 
     var body: some View {
+        HStack(alignment: .bottom, spacing: Theme.paneGap) {
+            ForEach(workspace.floating.compactMap { workspace.sessions[$0] }, id: \.id) { session in
+                if workspace.minimized.contains(session.id) {
+                    Button { workspace.setMinimized(session.id, false) } label: {
+                        Label(workspace.label(of: session), systemImage: session.showsFiles ? TerminalSession.filesSymbol : "terminal")
+                            .lineLimit(1).frame(maxWidth: Theme.floatingCapsule).fixedSize() // as wide as its name, to a point
+                    }
+                    .buttonStyle(Pill(font: Theme.chrome))
+                    .help("Show \(workspace.label(of: session))")
+                    .transition(Theme.arrival)
+                } else {
+                    PaneCard(session: session, floating: true)
+                        .frame(width: Theme.floatingPane.width, height: Theme.floatingPane.height)
+                        // Lifted off the panes under it, which are the same glass: the one shadow in the app, in the
+                        // scrim's colour.
+                        .background {
+                            RoundedRectangle(cornerRadius: Theme.paneRadius, style: .continuous)
+                                .fill(Color(nsColor: .shadowColor).opacity(Theme.scrim)).blur(radius: 16).offset(y: 6)
+                        }
+                        .transition(Theme.arrival)
+                }
+            }
+        }
+        .padding(.trailing, Theme.paneMargin + Theme.paneGap).padding(.bottom, Theme.bottomBar + Theme.paneGap)
+        .animation(Theme.motion, value: workspace.floating)
+        .animation(Theme.motion, value: workspace.minimized)
+        .environment(\.filesStyle, .soltz)
+    }
+}
+
+/// One pane: a session's terminal in a card with a header (title, directory, split, maximize, float, close), or its
+/// host's files (`FilesPane`, a card of its own), and the connecting or ended state over either. `floating`, it is a
+/// floating one's card (`FloatingPanes`): no part of a split.
+private struct PaneCard: View {
+    let session: TerminalSession
+    var floating = false
+    @Environment(Workspace.self) private var workspace
+    /// Narrower than `Theme.paneNarrow` (the window was made small, or a divider dragged): the header sheds buttons.
+    @ViewState private var narrow = false
+
+    var body: some View {
         let layout = workspace.layout
-        let isActive = layout.root?.findLeaf(layout.activePaneId)?.sessionId == session.id
-        let isSplit = (layout.root?.leaves.count ?? 0) > 1
+        let isActive = floating || layout.root?.findLeaf(layout.activePaneId)?.sessionId == session.id
+        let isSplit = !floating && (layout.root?.leaves.count ?? 0) > 1
         let shape = RoundedRectangle(cornerRadius: Theme.paneRadius, style: .continuous)
+        let over = workspace.dropTarget == Workspace.panel + session.id, side = over ? workspace.dropSide : nil
         Group {
             if session.showsFiles {
-                // In a hosting view of its own, as the terminal is, for the same two things: a click anywhere in it
-                // makes the pane the active one, and a sidebar row dropped on its list is taken (`ClickObserving`).
-                // What the pane reads from the environment goes in with it.
+                // In a hosting view of its own, as the terminal is, so that a click anywhere in it makes the pane the
+                // active one (`ClickObserving`). What the pane reads from the environment goes in with it.
                 ClickObserving(content: FilesPane(session: session, buttons: AnyView(buttons(isSplit: isSplit)))
                                    .environment(workspace).environment(\.filesStyle, .soltz),
-                               onClick: { workspace.activatePane(of: session.id) }, onDragOver: dragOver, onDrop: { workspace.openTab(for: $0) })
+                               onClick: { workspace.activatePane(of: session.id) })
             } else {
                 // The same glass as the sidebar's hosts card.
                 terminal(isSplit: isSplit).glassEffect(.regular, in: shape)
@@ -254,48 +285,111 @@ private struct PaneCard: View {
             if session.ended || !session.isAttached { state.transition(Theme.arrival) }
         }
         .animation(Theme.motion, value: session.ended || !session.isAttached)
-        .padding(Theme.paneGap / 2)
+        // A host or a session dragged here from the sidebar is new work beside this pane; a tab dragged here from
+        // the strip joins it, and so does another pane, dragged by its header (`PaneDrop` takes the drag). The
+        // half the new pane would take lights up, and glides as the pointer nears another side; all of it lights
+        // up under a pane held over its middle, which changes places with this one.
+        .overlay { if !floating { PaneDrop(onDragOver: dragOver, onDrop: drop).allowsHitTesting(false) } }
+        .overlay {
+            GeometryReader { box in
+                if over {
+                    let wide = side == .left || side == .right, tall = side == .top || side == .bottom
+                    shape.fill(.tint.opacity(Theme.dropFill)).overlay { shape.strokeBorder(.tint, lineWidth: 2) }
+                        .frame(width: wide ? box.size.width / 2 : nil, height: tall ? box.size.height / 2 : nil)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: side.map(Self.edge) ?? .center)
+                        .transition(.opacity)
+                }
+            }
+            .allowsHitTesting(false)
+        }
+        .animation(Theme.motion, value: over ? side?.rawValue ?? "middle" : nil)
+        .onGeometryChange(for: Bool.self) { $0.size.width < Theme.paneNarrow } action: { narrow = $0 }
+        .padding(floating ? 0 : Theme.paneGap / 2)
+    }
+
+    private static func edge(_ side: SplitPosition) -> Alignment {
+        switch side {
+        case .left: .leading
+        case .right: .trailing
+        case .top: .top
+        case .bottom: .bottom
+        }
     }
 
     private func terminal(isSplit: Bool) -> some View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
-                Image(systemName: "chevron.right").font(.system(size: Theme.paneIcon - 2, weight: .semibold))
-                    .foregroundStyle(.secondary).accessibilityHidden(true)
-                Text(session.title).font(Theme.chromeStrong).lineLimit(1)
-                if let cwd = session.cwd {
-                    Text(Self.abbreviated(cwd)).font(Theme.chromeRegular).foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
-                        .contentTransition(.opacity).transition(.opacity)
+                // The pane's handle: dragged onto another pane it moves there, onto the tabs it becomes a tab.
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right").font(.system(size: Theme.paneIcon - 2, weight: .semibold))
+                        .foregroundStyle(.secondary).accessibilityHidden(true)
+                    Text(session.title).font(Theme.chromeStrong).lineLimit(1)
+                    if let cwd = session.cwd {
+                        Text(Self.abbreviated(cwd)).font(Theme.chromeRegular).foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
+                            .contentTransition(.opacity).transition(.opacity)
+                    }
+                    Spacer(minLength: 2)
                 }
-                Spacer(minLength: 2)
+                .frame(maxHeight: .infinity)
+                .contentShape(.rect)
+                .draggable(Dragged(kind: .pane, id: session.id)) { DragChip(title: session.title, systemImage: "terminal") }
                 buttons(isSplit: isSplit)
             }
             .padding(.leading, 12)
             .padding(.trailing, 4)
             .frame(height: Theme.paneHeader)
+            .clipped() // what does not fit a very narrow pane is cut, not drawn over the pane beside it
             .animation(Theme.motion, value: session.cwd)
-            ClickObserving(content: SoltzTerminalView(session.terminal), onClick: { workspace.activatePane(of: session.id) },
-                           onDragOver: dragOver, onDrop: { workspace.openTab(for: $0) })
+            ClickObserving(content: SoltzTerminalView(session.terminal), onClick: { workspace.activatePane(of: session.id) })
                 .padding(.horizontal, 8)
                 .padding(.bottom, 8)
         }
     }
 
-    /// The app's drag is over this pane, or left it: the panel shows where it lands.
-    private func dragOver(_ over: Bool) {
+    /// The app's drag is over this pane, there, or left it (neither). False when it cannot land here. Told on every
+    /// move of the pointer, so nothing is set that is set already.
+    private func dragOver(_ drag: Dragged?, _ zone: PaneDrop.Zone?) -> Bool {
         let mine = Workspace.panel + session.id
-        if over { workspace.dropTarget = mine } else if workspace.dropTarget == mine { workspace.dropTarget = nil }
+        guard let drag, let zone, workspace.lands(drag, on: session.id) else {
+            if let drag, workspace.dropTarget != nil { Workspace.drags.notice("a \(drag.kind.rawValue, privacy: .public) cannot land on this pane") }
+            if workspace.dropTarget == mine { workspace.dropTarget = nil }
+            return false
+        }
+        if workspace.dropTarget != mine { workspace.dropTarget = mine }
+        if workspace.dropSide != side(drag, zone) { workspace.dropSide = side(drag, zone) }
+        return true
+    }
+
+    /// Where a drop there goes: beside the pane, on its nearest side; none for a pane held over the middle, which
+    /// changes places with this one.
+    private func side(_ drag: Dragged, _ zone: PaneDrop.Zone) -> SplitPosition? {
+        drag.kind == .pane && zone.middle ? nil : zone.side
+    }
+
+    private func drop(_ drag: Dragged, _ zone: PaneDrop.Zone) -> Bool {
+        let side = side(drag, zone)
+        let taken = side.map { workspace.openPane(for: drag, beside: session.id, $0) } ?? workspace.swap(drag, with: session.id)
+        Workspace.drags.notice("a \(drag.kind.rawValue, privacy: .public) dropped on a pane, \(side?.rawValue ?? "middle", privacy: .public): \(taken ? "taken" : "refused", privacy: .public)")
+        return taken
     }
 
     /// The pane's own buttons: each acts on this pane.
     private func buttons(isSplit: Bool) -> some View {
         let maximized = workspace.layout.maximizedPaneId != nil
         return HStack(spacing: 2) {
-            button("Split Right", "rectangle.split.2x1") { workspace.split(.right) }
-            button("Split Down", "rectangle.split.1x2") { workspace.split(.below) }
-            button(maximized ? "Restore Pane" : "Maximize Pane",
-                   maximized ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right") { workspace.toggleMaximize() }
-                .disabled(!isSplit)
+            if floating {
+                button("Back Among the Panes", "pip.exit") { workspace.restore(session.id) }
+                button("Minimize", "minus") { workspace.setMinimized(session.id, true) }
+            } else {
+                if !narrow {
+                    button("Split Right", "rectangle.split.2x1") { workspace.split(.right) }
+                    button("Split Down", "rectangle.split.1x2") { workspace.split(.below) }
+                }
+                button(maximized ? "Restore Pane" : "Maximize Pane",
+                       maximized ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right") { workspace.toggleMaximize() }
+                    .disabled(!isSplit)
+                button("Float Pane", "pip.enter") { workspace.float(session.id) }
+            }
             button("Close Pane", "xmark") { workspace.close(session.id) }
         }
     }
@@ -351,54 +445,76 @@ private struct PaneCard: View {
 
 /// Shows `content` and reports a click anywhere in it. SwiftUI gestures never see a mouse-down that
 /// an AppKit view (the terminal) takes, so the hit test of an enclosing view is watched instead.
-///
-/// It takes a sidebar row's drag over the terminal too. SwiftUI's own drop destination lies behind an AppKit view and
-/// is never reached over one; AppKit offers a drag to the view under the pointer and then to the views it is in, and
-/// the terminal asks only for text and files, so the app's own drag (`Dragged`) comes to this one. A files pane's
-/// list is an AppKit view as well, and is wrapped the same way.
 // shortcut: a nested hosting view per pane only to see clicks; drop it once SoltzTerminal reports focus changes.
 private struct ClickObserving<Content: View>: NSViewRepresentable {
     let content: Content
     let onClick: () -> Void
-    /// The app's drag came over the terminal, or left it.
-    let onDragOver: (Bool) -> Void
-    /// It was dropped; false when it cannot land here.
-    let onDrop: (Dragged) -> Bool
 
     func makeNSView(context _: Context) -> Host {
         let host = Host(rootView: content)
         host.sizingOptions = []
-        host.registerForDraggedTypes([Dragged.pasteboardType])
         return host
     }
 
     func updateNSView(_ host: Host, context _: Context) {
         host.rootView = content
-        (host.onClick, host.onDragOver, host.onDrop) = (onClick, onDragOver, onDrop)
+        host.onClick = onClick
     }
 
     final class Host: NSHostingView<Content> {
         var onClick: () -> Void = {}
-        var onDragOver: (Bool) -> Void = { _ in }
-        var onDrop: (Dragged) -> Bool = { _ in false }
 
         override func hitTest(_ point: NSPoint) -> NSView? {
             let hit = super.hitTest(point)
             if hit != nil, NSApp.currentEvent?.type == .leftMouseDown { onClick() }
             return hit
         }
+    }
+}
 
-        // Every step of the drop is answered here: the hosting view's own answers are SwiftUI's, for a drag it was
-        // never told had come in.
-        override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
-            let operation = draggingUpdated(sender)
-            if !operation.isEmpty { onDragOver(true) }
-            return operation
-        }
+/// Takes the app's own drag (`Dragged`) anywhere over a pane, and says which side of the pane the pointer is nearest.
+///
+/// It lies over the pane, as an AppKit view that asks for that one type. AppKit offers a drag to the frontmost view
+/// that asks for a type it carries, and to no other: under this one the terminal asks for text and files, and the
+/// file list for files, which SwiftUI's drag of anything carries a promise of, so the list would be offered the
+/// drag and refuse it. (SwiftUI's own drop destination lies behind them all.) Clicks pass through.
+private struct PaneDrop: NSViewRepresentable {
+    /// Where over the pane the pointer is: the side it is nearest, and whether it is in the middle (the inner two
+    /// fifths each way).
+    struct Zone {
+        let side: SplitPosition
+        let middle: Bool
+    }
 
-        /// One of the operations the drag allows; none for a tab, which is open already and opens nothing here.
+    /// The drag is over the pane, there; neither when it left. False when it cannot land.
+    let onDragOver: (Dragged?, Zone?) -> Bool
+    /// It was dropped there; false when it cannot land here.
+    let onDrop: (Dragged, Zone) -> Bool
+
+    func makeNSView(context _: Context) -> Catcher {
+        let view = Catcher()
+        view.registerForDraggedTypes([Dragged.pasteboardType])
+        return view
+    }
+
+    func updateNSView(_ view: Catcher, context _: Context) {
+        (view.onDragOver, view.onDrop) = (onDragOver, onDrop)
+    }
+
+    final class Catcher: NSView {
+        var onDragOver: (Dragged?, Zone?) -> Bool = { _, _ in false }
+        var onDrop: (Dragged, Zone) -> Bool = { _, _ in false }
+
+        override func hitTest(_: NSPoint) -> NSView? { nil }
+
+        override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation { draggingUpdated(sender) }
+
+        /// One of the operations the drag allows; none when it cannot land here.
         override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {
-            guard Self.dragged(sender)?.kind != .tab else { return [] }
+            guard let drag = Self.dragged(sender), onDragOver(drag, zone(of: sender)) else {
+                left()
+                return []
+            }
             let allowed = sender.draggingSourceOperationMask
             return [NSDragOperation.copy, .move, .generic].first(where: allowed.contains) ?? .generic
         }
@@ -407,14 +523,22 @@ private struct ClickObserving<Content: View>: NSViewRepresentable {
             sender.draggingPasteboard.data(forType: Dragged.pasteboardType).flatMap { try? JSONDecoder().decode(Dragged.self, from: $0) }
         }
 
-        override func draggingExited(_: (any NSDraggingInfo)?) { onDragOver(false) }
-        override func draggingEnded(_: any NSDraggingInfo) { onDragOver(false) }
+        /// Where over the pane the pointer is, each way measured against the pane's own width and height.
+        private func zone(of sender: any NSDraggingInfo) -> Zone {
+            let point = convert(sender.draggingLocation, from: nil)
+            let x = point.x / max(bounds.width, 1), down = (isFlipped ? point.y : bounds.height - point.y) / max(bounds.height, 1)
+            let side: SplitPosition = min(x, 1 - x) < min(down, 1 - down) ? (x < 0.5 ? .left : .right) : (down < 0.5 ? .top : .bottom)
+            return Zone(side: side, middle: abs(x - 0.5) < 0.2 && abs(down - 0.5) < 0.2)
+        }
+
+        private func left() { _ = onDragOver(nil, nil) }
+        override func draggingExited(_: (any NSDraggingInfo)?) { left() }
+        override func draggingEnded(_: any NSDraggingInfo) { left() }
         override func prepareForDragOperation(_: any NSDraggingInfo) -> Bool { true }
-        override func concludeDragOperation(_: (any NSDraggingInfo)?) {}
 
         override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
-            onDragOver(false)
-            return Self.dragged(sender).map(onDrop) ?? false
+            left()
+            return Self.dragged(sender).map { onDrop($0, zone(of: sender)) } ?? false
         }
     }
 }
@@ -564,9 +688,20 @@ private struct TabChip: View {
         // A tab dropped here takes this place, before this one; a sidebar row opens its tab.
         .dropDestination(for: Dragged.self) { drags, _ in
             workspace.dropTarget = nil
-            return drags.first.map { workspace.dropped($0, before: tab.id) } ?? false
+            let taken = drags.first.map { workspace.dropped($0, before: tab.id) } ?? false
+            Workspace.drags.notice("a \(drags.first?.kind.rawValue ?? "nothing", privacy: .public) dropped on a tab: \(taken ? "taken" : "refused", privacy: .public)")
+            return taken
         } isTargeted: { over in
-            if over { workspace.dropTarget = key } else if workspace.dropTarget == key { workspace.dropTarget = nil }
+            guard over else {
+                if workspace.dropTarget == key { workspace.dropTarget = nil }
+                return
+            }
+            workspace.dropTarget = key
+            // Held over a tab, a drag brings it on screen: the drop can go on to one of its panes.
+            Task {
+                try? await Task.sleep(for: .milliseconds(Theme.springLoad))
+                if workspace.dropTarget == key, workspace.layout.activeSplitTabId != tab.id { workspace.activate(tab.id) }
+            }
         }
         // Where the dragged tab would go: before this one.
         .overlay(alignment: .leading) {

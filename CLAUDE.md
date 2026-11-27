@@ -14,8 +14,24 @@ Swift packages in `Packages/`.
   Download, open to edit and save back). The shell is open under a files pane too, unseen: the files use its
   connection. So a files session is not kept in a multiplexer and runs no pre or post command (`forFiles`), and its
   shell exiting by itself reconnects it instead of closing the tab.
-- **A host or a session dragged from the sidebar onto the main panel, or the strip, is new work: it opens a new tab**
-  (`Workspace.openTab(for:)`). Nothing is moved or split by a drop.
+- **A host or a session dragged from the sidebar is new work on that host.** On a pane it opens a new pane on the
+  side of it the pointer is nearest (`Workspace.openPane(for:beside:_:)`; the half it would take is lit while
+  dragging), so a tab can hold panes of several hosts. On the strip, or on the panel while it is empty, it opens a
+  new tab (`Workspace.openTab(for:)`).
+- **A tab dragged from the strip is that tab.** On another tab it changes places; on a pane of the tab on screen it
+  joins it: its panes move in beside that one and it leaves the strip.
+- **A pane dragged by its header is that pane** (`Dragged.Kind.pane`): on a side of another pane it moves beside it,
+  on its middle the two change places (`Workspace.swap`), on the strip it becomes a tab of its own.
+- **Panes split the same way share the length equally** (`PaneNode.splitting`; dividers of other runs stay where
+  they were put), and no split leaves a pane under `Theme.paneLeast`: the new pane opens in a tab of its own
+  instead (`Workspace.place`). Under `Theme.paneNarrow` a pane's header keeps Maximize, Float and Close only.
+- **A drag held over a tab brings that tab on screen** (`Theme.springLoad`), so the drop can go on to one of its panes.
+- **When a drag does nothing, read what it did**: `log show --last 10m --predicate 'subsystem == "app.soltz"'`
+  (`Workspace.drags`: kinds and outcomes, no names).
+- **A floated pane** (`Workspace.float`, `floating`, `FloatingPanes`) is out of its tab, in a small card over the
+  corner of the main panel whatever tab is on screen, its session live and still listed under its host. Its button,
+  or its header dragged onto a pane or the strip, brings it back. **Minimized** (`setMinimized`), the card is a
+  capsule in that corner; a click on it, or on its row in the sidebar, brings the card back.
 
 ## Design: one glass, everywhere
 
@@ -47,10 +63,13 @@ Rules:
   write font sizes or paddings inline when a `Theme` value exists.
 - **Buttons**: `Pill` for capsule buttons; `Pill(prominent: true)` for the one main action (Connect, Done, "+").
 - **Drag and drop**: what is dragged shows as a `DragChip` (icon and name; a drag image is a still picture, so it is
-  the one surface that is not glass). Where it would land gets the tint outline (`dropOutline`), or a tint mark
-  between tabs. Files drag as the system's own rows. What the app itself drags (a host, a session, a tab) carries a
-  type of its own (`Dragged`), never text: a terminal pastes dropped text into its shell. And over a terminal the
-  drop is taken by the AppKit view around it (`ClickObserving`): SwiftUI's drop destination lies behind AppKit views.
+  the one surface that is not glass). Where it would land gets the tint outline (`dropOutline`), a tint mark
+  between tabs, or, for the half of a pane a new pane would take, the outline over a faint tint (`Theme.dropFill`). Files drag as the system's own rows. What the app itself drags (a host, a session, a tab) carries a
+  type of its own (`Dragged`), never text: a terminal pastes dropped text into its shell. And over a pane the
+  drop is taken by an AppKit view lying on top of it (`PaneDrop`): AppKit offers a drag to the frontmost view that
+  asks for a type it carries and to no other, the file list asks for files, and SwiftUI's drag of anything carries
+  a promise of a file. Test a drop with `SystemDrop` (Smoke.swift), a drop the system itself makes; a call into a
+  view's dragging methods proves nothing about which view is offered the drag.
 - **Motion**: one spring, `Theme.motion` (settles quickly, no bounce), and one entrance, `Theme.arrival` (fade from
   just under size). Pages, panes, cards, tabs and selection use them; no other durations or curves. Never animate
   something that follows the pointer (divider drags). `Theme.motion` is nil under Reduce Motion and in test runs.
@@ -68,7 +87,7 @@ build/test.noindex/SoltzTest.app/Contents/MacOS/Soltz --snapshot "$PWD/build/sna
 ```
 
 Read the `*-live.png` files (window over a colourful stand-in desktop). A new page or popup gets a capture in
-`Snapshot.swift`. `new-host-opening.png`, `new-host-closing.png`, `pane-maximizing.png`, `tab-to-files.png` and `drop-to-tab.png` are
+`Snapshot.swift`. `new-host-opening.png`, `new-host-closing.png`, `pane-maximizing.png`, `tab-to-files.png`, `drop-to-pane.png`, `pane-floating.png` and `float-minimizing.png` are
 frame-by-frame films of a transition: no frame may show a grey panel, the scrim at full strength before its card, or
 a jump (that is a flicker on screen). Film a new transition with `film(...)` in `Snapshot.swift`.
 

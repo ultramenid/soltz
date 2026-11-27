@@ -133,6 +133,39 @@ extension PaneNode {
         }
     }
 
+    /// The tree with `leaf` on that side of the pane `paneId`. The run of splits it joins (those the same way, with
+    /// no split the other way between them) then shares its length equally: a pane split to the right three times
+    /// is four equal columns, not a half, a quarter and two eighths. Dividers elsewhere stay where they were put.
+    public func splitting(_ paneId: String, with leaf: LeafNode, _ position: SplitPosition) -> PaneNode {
+        guard let target = findLeaf(paneId) else { return self }
+        return replacingLeaf(paneId, with: splitLeaf(target, leaf, position)).equalizing(splitGeometry(position).direction, around: leaf.id)
+    }
+
+    func equalizing(_ direction: SplitDirection, around paneId: String) -> PaneNode {
+        guard case .split(var split) = self else { return self }
+        split.first = split.first.equalizing(direction, around: paneId)
+        split.second = split.second.equalizing(direction, around: paneId)
+        if split.direction == direction, split.first.reaches(paneId, direction) || split.second.reaches(paneId, direction) {
+            let first = split.first.span(direction)
+            split.ratio = Double(first) / Double(first + split.second.span(direction))
+        }
+        return .split(split)
+    }
+
+    /// Whether the pane is in this node's run of `direction` splits.
+    private func reaches(_ paneId: String, _ direction: SplitDirection) -> Bool {
+        switch self {
+        case .leaf(let leaf): leaf.id == paneId
+        case .split(let split): split.direction == direction && (split.first.reaches(paneId, direction) || split.second.reaches(paneId, direction))
+        }
+    }
+
+    /// How many panes the node's run of `direction` splits puts in a row.
+    private func span(_ direction: SplitDirection) -> Int {
+        guard case .split(let split) = self, split.direction == direction else { return 1 }
+        return split.first.span(direction) + split.second.span(direction)
+    }
+
     func updatingRatio(_ splitNodeId: String, _ ratio: Double) -> PaneNode {
         guard case .split(var split) = self else { return self }
         if split.id == splitNodeId {

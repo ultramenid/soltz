@@ -101,6 +101,21 @@ public final class LayoutStore {
         pinnedKeys = withoutSessionKeys(pinnedKeys, [sessionId])
     }
 
+    /// Shows `sessionId` in the pane `paneId` of the active tab and returns the session that was there. A session
+    /// with a pane of its own in the tab changes places with it; one in another tab is left where it is.
+    @discardableResult
+    public func swapSession(in paneId: String, with sessionId: String) -> String? {
+        guard let root, let target = root.findLeaf(paneId), target.sessionId != sessionId else { return nil }
+        let other = root.findLeaf(session: sessionId)
+        if other == nil, findSessionPane(splitTabs, sessionId) != nil { return nil }
+        var next = root.replacingLeaf(target.id, with: .leaf(LeafNode(id: target.id, sessionId: sessionId)))
+        if let other { next = next.replacingLeaf(other.id, with: .leaf(LeafNode(id: other.id, sessionId: target.sessionId))) }
+        updateActiveTab { $0.root = next }
+        self.root = next
+        focus(target.id)
+        return target.sessionId
+    }
+
     public func movePane(_ sourcePaneId: String, _ targetPaneId: String, _ position: SplitPosition) {
         guard let root, sourcePaneId != targetPaneId else { return }
         let (withoutSource, removed) = root.removingLeaf(sourcePaneId)
@@ -251,7 +266,7 @@ public final class LayoutStore {
 
     /// Replace `target` in `root` with a split of target + `leaf`, focusing `leaf`.
     private func insert(_ leaf: LeafNode, splitting target: LeafNode, position: SplitPosition, in root: PaneNode) {
-        let next = root.replacingLeaf(target.id, with: splitLeaf(target, leaf, position))
+        let next = root.splitting(target.id, with: leaf, position)
         updateActiveTab {
             $0.root = next
             $0.activePaneId = leaf.id

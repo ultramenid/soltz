@@ -67,6 +67,11 @@ enum Theme {
     static let paneButton: CGFloat = 20         // a header icon's hover circle
     static let paneUnfocused = 0.7              // a split's panes that do not have the keys (Ghostty's own default)
     static let bottomBar: CGFloat = 44
+    static let floatingPane = CGSize(width: 400, height: 250) // a floating pane's card
+    static let paneLeast = CGSize(width: 260, height: 150) // no split leaves a pane smaller: it opens in a tab instead
+    static let paneNarrow: CGFloat = 340        // under it a pane's header keeps only Maximize, Float and Close
+    static let floatingCapsule: CGFloat = 140   // a minimized one's name, at most
+    static let springLoad = 600                 // ms a drag is held over a tab before it comes on screen
     static let tabBar: CGFloat = 28             // the tabs' capsule, and the "+" beside it
     static let tabPill: CGFloat = 22            // a tab inside it
 
@@ -78,6 +83,7 @@ enum Theme {
     static let fieldWidth: CGFloat = 154        // 86 px
     static let buttonHeight: CGFloat = 26       // 14.3 px
     static let scrim = 0.32                     // the window behind a popup's card
+    static let dropFill = 0.16                  // the half of a pane a dropped row's pane would take
 }
 
 /// What follows the pointer while a host or a tab is dragged: its icon and name in a capsule, not a picture of the
