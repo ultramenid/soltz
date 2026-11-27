@@ -5,8 +5,9 @@ Swift packages in `Packages/`.
 
 ## Layout: a sidebar, panes and one strip of tabs
 
-- **Sidebar** (`HomeView`): a tree. Groups are folders of hosts; each host holds its open sessions as a folder holds
-  files. Both close and open from their chevron.
+- **Sidebar** (`HomeView`): a tree. Groups are folders of hosts; each host holds its open tabs as a folder holds
+  files (`Workspace.sessionRows(of:)`): one row a tab, and a tab of several panes shows its icon as a stack of
+  cards (`Theme.stackMost`). Both close and open from their chevron.
 - **Main panel**: the panes of the tab on screen (`Workspace.shown` is its host; none shows a hint), and under them
   the one strip of tabs, every host's together. Tabs change places by dragging; a closed tab's neighbour shows.
 - **A session shows its terminal or its host's files** (`TerminalSession.showsFiles`, `FilesPane`): Files is a kind of
@@ -14,6 +15,26 @@ Swift packages in `Packages/`.
   Download, open to edit and save back). The shell is open under a files pane too, unseen: the files use its
   connection. So a files session is not kept in a multiplexer and runs no pre or post command (`forFiles`), and its
   shell exiting by itself reconnects it instead of closing the tab.
+- **A session live on a host but not open here is listed under it, dimmed** (`Workspace.liveRows(of:)`, `LiveRow`,
+  `liveRow`): another device's, or one this Mac left running. The host itself is asked (`Session.liveSessions`:
+  tmux's own list, else GNU screen's) over a connected session of it, after a connect, after a close and when the
+  app comes to the front; nothing is synced. A Quick Connect host's are under This Mac, named by `user@host`. A
+  click, or Return on the row, joins it in a tab (`Workspace.join`, `forAttaching`): attach only, no pre-command.
+  "End Session" in the row's menu ends it without opening it. Every terminal pane is a tmux session of its own;
+  a files pane is none.
+- **Closing a terminal ends its session on the host**, for every device that has it open
+  (`TerminalSession.close`: `endLiveSession` before the core's own close, which would leave a session another
+  client is attached to). A dropped one is ended over another connection of that host, if there is one
+  (`Workspace.end`); otherwise it stays until its TTL and is listed as live. Quitting closes nothing: the sessions
+  are what the next launch reopens.
+- **A launch reopens the tabs of last time** (`Workspace.saved`, `reopen`; `workspace.json` in the data folder,
+  written when the app is left and when it quits, no secret in it): each pane where it was, a terminal attached to
+  the session it was (its tab goes if that has ended), a files pane on its folder, a local shell new. A Quick
+  Connect pane is not reopened: its login is in no vault.
+- **The device typed on has the session at its own size** (`take_size_command`, `resize-window`): on attaching, on
+  a resize, and on the first key after three seconds without one. Other devices on that session mirror it. Check
+  such a change against a real tmux: `window-size latest` does nothing for control clients, and tmux prints a tab
+  in a format as `_`.
 - **A host or a session dragged from the sidebar is new work on that host.** On a pane it opens a new pane on the
   side of it the pointer is nearest (`Workspace.openPane(for:beside:_:)`; the half it would take is lit while
   dragging), so a tab can hold panes of several hosts. On the strip, or on the panel while it is empty, it opens a
@@ -26,6 +47,9 @@ Swift packages in `Packages/`.
   they were put), and no split leaves a pane under `Theme.paneLeast`: the new pane opens in a tab of its own
   instead (`Workspace.place`). Under `Theme.paneNarrow` a pane's header keeps Maximize, Float and Close only.
 - **A drag held over a tab brings that tab on screen** (`Theme.springLoad`), so the drop can go on to one of its panes.
+- **From the keyboard**: ⇧⌘ with an arrow opens a new pane on that side of the active one (the Shell menu; ⌘D and
+  ⇧⌘D stay for right and below), and ⇧⌘+ asks what "+" asks (`Workspace.askNewTab`: an AppKit menu over "+", as a
+  SwiftUI `Menu` cannot be opened by code). A text field keeps ⇧⌘ with an arrow for its selection (`handleKey`).
 - **When a drag does nothing, read what it did**: `log show --last 10m --predicate 'subsystem == "app.soltz"'`
   (`Workspace.drags`: kinds and outcomes, no names).
 - **A floated pane** (`Workspace.float`, `floating`, `FloatingPanes`) is out of its tab, in a small card over the
@@ -141,7 +165,8 @@ These came out of a security audit; keep them when changing the code they cover.
 - **Host keys**: an unknown or changed key is always asked about (`verify_or_prompt`, `hostKeyAlert`); nothing pins a
   key silently. Cancel is the default button of every trust question. An answer names the fingerprint it is for.
 - **Names from a host** (file names, the working directory from OSC 7) are checked before they reach a path or a shell
-  (`is_plain_name` in the core, `Paths.isPlainName` in `TransferQueue`, the control-character filters in `client.rs`).
+  (`is_plain_name` in the core, `Paths.isPlainName` in `TransferQueue`, the control-character filters in `client.rs`,
+  `parse_live_sessions` for the session names a host lists).
 - **Secrets**: saved logins, env-variable values, notes and pre/post commands live in the vault only
   (`sealingEnv` / `withEnv` in `Storage.swift`; the host's row on disk carries none of them); a connected session of a saved host keeps
   none in `TerminalSession.args` (`currentArgs` reads them again). A key login never carries the password too.

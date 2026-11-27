@@ -5,13 +5,30 @@
 A native macOS SSH client: terminals and file transfer, nothing else. Free, no account. macOS 27 or later, Apple
 silicon.
 
-![Soltz in dark mode: the sidebar of hosts, and one host's three terminals side by side in a tab](docs/screenshot-dark.png)
+![Soltz in dark mode: the sidebar of hosts with one host's tabs under it, and three of its terminals side by side in a tab](docs/screenshot-dark.png)
 
 ![The same window in light mode](docs/screenshot-light.png)
 
 Soltz is a Swift rewrite of [Voltius](https://github.com/VoltiusApp/voltius): its Rust core is a trimmed, modified
 copy of that project's backend, and the app is a port of its frontend. Licensed under the GNU Affero General Public
 License v3.0 (`LICENSE`); credits and third-party notices are in `NOTICE.md`.
+
+## Sessions that stay
+
+A terminal on a host runs inside tmux on that host (GNU screen where there is no tmux), one session a pane. So it
+outlives the connection, and the app:
+
+- **A dropped connection** reconnects by itself, to the same shell.
+- **Quit and open Soltz again**, and every tab and pane is back where it was: a terminal attached to the session it
+  was, a files pane on its folder.
+- **From another Mac.** A session running on a host that is not open on this Mac is listed under the host, dimmed,
+  while you are connected to that host: one another Mac has open, or one left running. Click it to open it here,
+  scrollback and all. The host itself is asked what it has; nothing is synced and there is no account. Both Macs
+  need the host saved, with the same user on it. The Mac you type on has the session at its own window's size.
+- **Closing a terminal ends its session** on the host, wherever else it is open. Quitting the app ends none.
+
+A host with neither tmux nor screen connects all the same; its sessions end with the connection. In the sidebar a
+tab is one row under its host, and a tab of several panes shows its icon as a stack.
 
 ## Install
 
@@ -66,6 +83,9 @@ How Soltz treats what you give it:
   names a server lists are checked before they become paths on your Mac,
   downloaded files are marked as downloaded (macOS checks apps and scripts among them before their first run), and
   a program in the terminal must ask before it can change your clipboard. Risky pastes are asked about.
+- **Sessions.** The names of the sessions a host lists are checked before one goes into a command, as file names
+  are. What a launch reopens is kept in `workspace.json` beside the hosts: which host, which session and which
+  folder, and no login.
 - **Updates.** The app only checks whether a newer release exists and links to its page on GitHub. It downloads and
   installs nothing.
 

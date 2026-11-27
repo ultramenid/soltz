@@ -493,6 +493,20 @@ async fn a_persistent_session_runs_tmux_control_mode_and_reattaches_by_id() {
     })
     .await;
 
+    // Attaching takes the window's size for this device, whoever else has the session open.
+    wait_for("the size taken", || {
+        target
+            .shell_input()
+            .contains(&format!("resize-window -t soltz_{id} -x "))
+    })
+    .await;
+
+    // What else is live on the host: only names that are Soltz's own come back.
+    let live = session.clone().live_sessions().await.unwrap();
+    assert_eq!(live.len(), 1, "{live:?}");
+    assert_eq!(live[0].session_id, "soltz-elsewhere");
+    assert_eq!((live[0].clients, live[0].cwd.as_deref()), (1, Some("/srv/my app")));
+
     session.clone().write(b"ls\n".to_vec()).await.unwrap();
     wait_for("the keys, as tmux commands", || {
         target
@@ -536,4 +550,20 @@ async fn a_persistent_session_runs_tmux_control_mode_and_reattaches_by_id() {
         "{:?}",
         ended.map(|_| ())
     );
+}
+
+#[tokio::test]
+async fn a_live_session_is_ended_only_by_an_id_of_soltzs_own() {
+    let target = serve(key(1)).await;
+    let core = Core::new();
+    let sink = Arc::new(Recorder::default());
+    let session = connect(&core, &sink, args(target.port, json!({"persist": false})))
+        .await
+        .unwrap();
+    let ended = session.clone().end_live_session("soltz-elsewhere".into());
+    assert!(ended.await.unwrap());
+    assert!(target.seen(|s| s.execs.iter().any(|e| e.contains("SOLTZ_KILLED"))));
+    let refused = session.clone().end_live_session("soltz-$(reboot)".into());
+    assert!(refused.await.is_err());
+    session.close().await.unwrap();
 }

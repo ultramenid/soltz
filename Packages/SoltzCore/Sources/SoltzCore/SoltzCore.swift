@@ -487,6 +487,22 @@ fileprivate struct FfiConverterUInt16: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
+    typealias FfiType = UInt32
+    typealias SwiftType = UInt32
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt32 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
     typealias FfiType = UInt64
     typealias SwiftType = UInt64
@@ -1872,9 +1888,22 @@ public protocol SessionProtocol: AnyObject, Sendable {
     func disconnect(postCommand: String?, killPersistent: Bool, attached: Bool, reconnecting: Bool) async throws  -> Bool
     
     /**
+     * Ends one of [`Session::live_sessions`], `session_id`, on the host, whoever
+     * has it open. Whether the host confirmed it.
+     */
+    func endLiveSession(sessionId: String) async throws  -> Bool
+    
+    /**
      * What [`Core::ssh_connect`] reconnects under.
      */
     func id()  -> String
+    
+    /**
+     * The persistent sessions on this session's host, its own among them: what
+     * another device, or this one before it quit, left running there. Each is
+     * joined with [`Core::ssh_connect`], its `sessionId` and `attachOnly`.
+     */
+    func liveSessions() async throws  -> [LiveSession]
     
     func resize(cols: UInt16, rows: UInt16) async throws 
     
@@ -2009,6 +2038,26 @@ open func disconnect(postCommand: String?, killPersistent: Bool, attached: Bool,
 }
     
     /**
+     * Ends one of [`Session::live_sessions`], `session_id`, on the host, whoever
+     * has it open. Whether the host confirmed it.
+     */
+open func endLiveSession(sessionId: String)async throws  -> Bool  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_soltz_core_fn_method_session_end_live_session(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(sessionId)
+                )
+            },
+            pollFunc: ffi_soltz_core_rust_future_poll_i8,
+            completeFunc: ffi_soltz_core_rust_future_complete_i8,
+            freeFunc: ffi_soltz_core_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
      * What [`Core::ssh_connect`] reconnects under.
      */
 open func id() -> String  {
@@ -2018,6 +2067,27 @@ open func id() -> String  {
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
+}
+    
+    /**
+     * The persistent sessions on this session's host, its own among them: what
+     * another device, or this one before it quit, left running there. Each is
+     * joined with [`Core::ssh_connect`], its `sessionId` and `attachOnly`.
+     */
+open func liveSessions()async throws  -> [LiveSession]  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_soltz_core_fn_method_session_live_sessions(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_soltz_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_soltz_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_soltz_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeLiveSession.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
 open func resize(cols: UInt16, rows: UInt16)async throws   {
@@ -2642,6 +2712,90 @@ public func FfiConverterTypeTransferSink_lower(_ value: TransferSink) -> UInt64 
 }
 
 
+
+
+/**
+ * A persistent session found on the host: this app's on another device, or one
+ * this device left running.
+ */
+public struct LiveSession: Equatable, Hashable {
+    /**
+     * What `ssh_connect` attaches to it under (`sessionId`, with `attachOnly`).
+     */
+    public var sessionId: String
+    /**
+     * Clients attached to it now.
+     */
+    public var clients: UInt32
+    /**
+     * When it was started, in seconds since 1970; 0 when the host does not say.
+     */
+    public var created: UInt64
+    public var cwd: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * What `ssh_connect` attaches to it under (`sessionId`, with `attachOnly`).
+         */sessionId: String, 
+        /**
+         * Clients attached to it now.
+         */clients: UInt32, 
+        /**
+         * When it was started, in seconds since 1970; 0 when the host does not say.
+         */created: UInt64, cwd: String?) {
+        self.sessionId = sessionId
+        self.clients = clients
+        self.created = created
+        self.cwd = cwd
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension LiveSession: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLiveSession: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LiveSession {
+        return
+            try LiveSession(
+                sessionId: FfiConverterString.read(from: &buf), 
+                clients: FfiConverterUInt32.read(from: &buf), 
+                created: FfiConverterUInt64.read(from: &buf), 
+                cwd: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LiveSession, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.sessionId, into: &buf)
+        FfiConverterUInt32.write(value.clients, into: &buf)
+        FfiConverterUInt64.write(value.created, into: &buf)
+        FfiConverterOptionString.write(value.cwd, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLiveSession_lift(_ buf: RustBuffer) throws -> LiveSession {
+    return try FfiConverterTypeLiveSession.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLiveSession_lower(_ value: LiveSession) -> RustBuffer {
+    return FfiConverterTypeLiveSession.lower(value)
+}
 
 
 public 
@@ -3637,6 +3791,31 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
         return seq
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeLiveSession: FfiConverterRustBuffer {
+    typealias SwiftType = [LiveSession]
+
+    public static func write(_ value: [LiveSession], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeLiveSession.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [LiveSession] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [LiveSession]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeLiveSession.read(from: &buf))
+        }
+        return seq
+    }
+}
 private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
 private let UNIFFI_RUST_FUTURE_POLL_WAKE: Int8 = 1
 
@@ -3830,7 +4009,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_soltz_core_checksum_method_session_disconnect() != 8693) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_soltz_core_checksum_method_session_end_live_session() != 326) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_soltz_core_checksum_method_session_id() != 16931) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_soltz_core_checksum_method_session_live_sessions() != 16407) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_soltz_core_checksum_method_session_resize() != 13647) {

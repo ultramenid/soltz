@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import AppKit
+import SoltzCore
 import SoltzHostsUI
 import SoltzModel
 import SoltzWorkspace
@@ -105,6 +106,24 @@ extension Workspace {
 }
 
 /// What the group card names: a new group (`host` moves into it, if given) or `folder` renamed.
+/// The frame of a row under a host, an open session's or a live one's: its pill, and where its content starts.
+private struct Leaf<Highlight: View>: ViewModifier {
+    let start: CGFloat
+    let pill: CGFloat
+    @ViewBuilder let highlight: Highlight
+
+    func body(content: Content) -> some View {
+        content
+            .padding(.leading, start - pill)
+            .padding(.trailing, 4)
+            .frame(height: Theme.sessionRow)
+            .background { highlight }
+            .padding(.leading, pill)
+            .padding(.vertical, 1)
+            .contentShape(.rect)
+    }
+}
+
 struct GroupNaming: Identifiable {
     let id = UUID()
     var folder: Folder?
@@ -180,7 +199,10 @@ struct HomeView: View {
         let closed = closed
         let rows = groups.flatMap { group in group.folder.map { closed.contains($0.id) } == true ? [] : group.rows }
         // What the arrows step through: each host, then the sessions it shows.
-        let ids = rows.flatMap { row in [row.id] + (closed.contains(row.id) ? [] : workspace.sessions(of: row.id).map(\.id)) }
+        let ids = rows.flatMap { row in
+            [row.id] + (closed.contains(row.id) || workspace.sessions(of: row.id).isEmpty ? []
+                : workspace.sessionRows(of: row.id).map { shown(of: $0).id } + workspace.liveRows(of: row.id).map(\.id))
+        }
         let active = workspace.shown == nil ? nil : workspace.activeSession?.id
         VStack(alignment: .leading, spacing: 0) {
             header
@@ -267,7 +289,13 @@ struct HomeView: View {
                 .onKeyPress(.upArrow) { move(-1, in: ids) }
                 .onKeyPress(.return) {
                     guard let selection, ids.contains(selection) else { return .ignored }
-                    if workspace.sessions[selection] != nil { workspace.reveal(selection) } else { workspace.open(selection) }
+                    if workspace.sessions[selection] != nil {
+                        workspace.reveal(selection)
+                    } else if let live = workspace.liveRow(selection) {
+                        workspace.join(live)
+                    } else {
+                        workspace.open(selection)
+                    }
                     return .handled
                 }
                 .onKeyPress(.escape) {
@@ -334,7 +362,10 @@ struct HomeView: View {
                         hostRow(host, level: level, sessions: sessions, closed: hostClosed).transition(.opacity)
                         if !hostClosed, !sessions.isEmpty {
                             VStack(spacing: 0) {
-                                ForEach(sessions, id: \.id) { sessionRow($0, level: level + 1).transition(.opacity) }
+                                ForEach(workspace.sessionRows(of: host.id), id: \.first?.id) {
+                                    sessionRow($0, level: level + 1).transition(.opacity)
+                                }
+                                ForEach(workspace.liveRows(of: host.id)) { liveRow($0, level: level + 1).transition(.opacity) }
                             }
                             .background(alignment: .leading) { guide(level: level) }
                             .transition(.opacity)
@@ -518,46 +549,93 @@ struct HomeView: View {
         }
     }
 
-    /// A session of the host above it, as a file in its folder: a terminal, or the host's files. A click shows it,
-    /// in its tab and pane; dragged onto the main panel, it opens another like it in a new tab.
-    private func sessionRow(_ session: TerminalSession, level: Int) -> some View {
+    /// The session a row of several stands for: the one that has the keys, else the one its tab shows, else the first.
+    private func shown(of row: [TerminalSession]) -> TerminalSession {
+        let tab = workspace.layout.splitTabs.first { $0.root.sessionIds.contains(row[0].id) }
+        return row.first { $0.id == selection } ?? row.first { $0.id == tab?.root.findLeaf(tab?.activePaneId)?.sessionId } ?? row[0]
+    }
+
+    /// A tab of the host above it, as a file in its folder: its panes on that host together in one row, an icon
+    /// for each, stacked (a terminal, or the host's files). A click shows the tab; dragged onto the main panel, it
+    /// opens another session like it in a new tab.
+    private func sessionRow(_ row: [TerminalSession], level: Int) -> some View {
+        let session = shown(of: row)
         let id = session.id
-        let ended = session.ended
-        let title = workspace.label(of: session)
+        let ended = row.allSatisfy(\.ended)
+        let tab = row.count > 1 ? workspace.layout.splitTabs.first { $0.root.sessionIds.contains(id) } : nil
+        let title = tab?.name ?? workspace.label(of: session)
         let symbol = session.showsFiles ? TerminalSession.filesSymbol : "terminal"
+        let close = { row.forEach { workspace.close($0.id) } }
         return HStack(spacing: 4) {
-            Image(systemName: symbol).font(Theme.chromeRegular).foregroundStyle(.secondary).frame(width: Theme.treeIcon)
-                .accessibilityHidden(true)
+            // The icon of the pane it stands for; over it the top edge of each card under it, a stack of the tab's panes.
+            Image(systemName: symbol).font(Theme.chromeRegular)
+                .overlay(alignment: .top) {
+                    ForEach(1..<min(row.count, Theme.stackMost + 1), id: \.self) { under in
+                        Capsule().frame(height: Theme.stackLine).padding(.horizontal, CGFloat(under) * Theme.stackRise)
+                            .offset(y: -CGFloat(under) * Theme.stackRise)
+                    }
+                }
+                .offset(y: CGFloat(min(row.count - 1, Theme.stackMost)) * Theme.stackRise / 2) // the stack, not its top card, is centred
+                .foregroundStyle(.secondary).frame(width: Theme.treeIcon).accessibilityHidden(true)
             Text(title).font(Theme.body).lineLimit(1)
             Spacer(minLength: 4)
             if hovered == id {
-                Button("Close", systemImage: "xmark") { workspace.close(id) }
+                Button("Close", systemImage: "xmark", action: close)
                     .labelStyle(.iconOnly).buttonStyle(PaneButton())
-                    .help("Close this session")
+                    .help(row.count == 1 ? "Close this session" : "Close these \(row.count) sessions")
                     .transition(Theme.arrival)
             }
         }
         .foregroundStyle(ended ? .secondary : .primary)
-        .padding(.leading, inset(level) + Theme.treeSlot + 4 - pillStart(level))
-        .padding(.trailing, 4)
-        .frame(height: Theme.sessionRow)
-        .background { highlight(id) }
+        .modifier(Leaf(start: inset(level) + Theme.treeSlot + 4, pill: pillStart(level)) { highlight(id) })
         .onHover { hovered = $0 ? id : (hovered == id ? nil : hovered) }
-        .padding(.leading, pillStart(level))
-        .padding(.vertical, 1)
-        .contentShape(.rect)
         .onTapGesture {
             selection = id
             workspace.reveal(id)
         }
         .draggable(Dragged(kind: .session, id: id)) { DragChip(title: title, systemImage: symbol) }
-        .contextMenu { Button("Close") { workspace.close(id) } }
+        .contextMenu { Button(row.count == 1 ? "Close" : "Close \(row.count) Sessions", action: close) }
         .help(ended ? "\(title) — ended" : title)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(ended ? "\(title), session, ended" : "\(title), session")
+        .accessibilityLabel("\(title), \(row.count == 1 ? "session" : "\(row.count) sessions")\(ended ? ", ended" : "")")
         .accessibilityAddTraits(selection == id ? [.isButton, .isSelected] : .isButton)
         .accessibilityAction { workspace.reveal(id) }
-        .accessibilityAction(named: "Close") { workspace.close(id) }
+        .accessibilityAction(named: "Close", close)
+    }
+
+    /// A session live on the host that is not open here: another device's, or one this Mac left running. A click
+    /// opens it in a tab: the same shell, shared.
+    private func liveRow(_ row: LiveRow, level: Int) -> some View {
+        let id = row.id, live = row.session
+        let folder = live.cwd?.split(separator: "/").last.map(String.init)
+        let named = [row.host, folder].compactMap(\.self)
+        let title = named.isEmpty ? "Session" : named.joined(separator: " · ")
+        let note = live.clients > 0 ? "Open on another device" : "Left running on the host"
+        return HStack(spacing: 4) {
+            Image(systemName: "rectangle.connected.to.line.below").font(Theme.chromeRegular).frame(width: Theme.treeIcon)
+                .accessibilityHidden(true)
+            Text(title).font(Theme.body).lineLimit(1)
+            Spacer(minLength: 4)
+            if live.created > 0 { // GNU screen does not say when
+                Text(Date(timeIntervalSince1970: TimeInterval(live.created)), format: .relative(presentation: .numeric, unitsStyle: .narrow))
+                    .font(Theme.chromeRegular).monospacedDigit().lineLimit(1)
+                    .padding(.trailing, Theme.cardInset - Theme.rowInset - 4) // under the hosts' own details
+            }
+        }
+        .foregroundStyle(.secondary) // not open here
+        .modifier(Leaf(start: inset(level) + Theme.treeSlot + 4, pill: pillStart(level)) { highlight(id) })
+        .onHover { hovered = $0 ? id : (hovered == id ? nil : hovered) }
+        .onTapGesture { workspace.join(row) }
+        .contextMenu {
+            Button("Open Here") { workspace.join(row) }
+            Button("End Session", role: .destructive) { workspace.endLive(row) }
+        }
+        .help("\(note). Click to open it here too.")
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(title), \(note.lowercased())")
+        .accessibilityAddTraits(selection == id ? [.isButton, .isSelected] : .isButton)
+        .accessibilityAction { workspace.join(row) }
+        .accessibilityAction(named: "End Session") { workspace.endLive(row) }
     }
 
     /// A row's hover and selection.

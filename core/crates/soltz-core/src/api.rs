@@ -12,6 +12,7 @@ use crate::knock::KnockSpec;
 use crate::known_hosts::{ConflictAction, KnownHostsStore, PendingConflicts};
 use crate::local::session::LocalSessionManager;
 use crate::proxy::ProxySpec;
+pub use crate::shell_integration::LiveSession;
 use crate::sftp::SftpManager;
 use crate::ssh::client::{self, HopRoute, JumpHostConnect};
 use crate::ssh::control_mode::TerminalColors;
@@ -673,6 +674,26 @@ impl Session {
             let ssh = &self.core.ssh;
             ssh.disconnect(id, post_command, kill_persistent, attached)
                 .await
+        })
+        .await
+        .map_err(failed)
+    }
+
+    /// The persistent sessions on this session's host, its own among them: what
+    /// another device, or this one before it quit, left running there. Each is
+    /// joined with [`Core::ssh_connect`], its `sessionId` and `attachOnly`.
+    pub async fn live_sessions(self: Arc<Self>) -> Result<Vec<LiveSession>, CoreError> {
+        on_runtime(async move { self.core.ssh.live_sessions(&self.app.session_id).await })
+            .await
+            .map_err(failed)
+    }
+
+    /// Ends one of [`Session::live_sessions`], `session_id`, on the host, whoever
+    /// has it open. Whether the host confirmed it.
+    pub async fn end_live_session(self: Arc<Self>, session_id: String) -> Result<bool, CoreError> {
+        on_runtime(async move {
+            let ssh = &self.core.ssh;
+            ssh.end_live(&self.app.session_id, &session_id).await
         })
         .await
         .map_err(failed)

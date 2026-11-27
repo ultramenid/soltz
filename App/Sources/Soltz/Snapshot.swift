@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import AppKit
 import Foundation
+import SoltzCore
 import SoltzHostsUI
 import SoltzModel
 import SwiftUI
@@ -153,6 +154,9 @@ enum Snapshot {
             if let first { workspace.activate(first) }
             workspace.activatePane(of: logs.id)
         }
+        // Under the host, a session another device has open on it.
+        workspace.live[web] = [LiveSession(sessionId: "soltz-elsewhere", clients: 1, created: UInt64(Date.now.timeIntervalSince1970) - 7200,
+                                           cwd: "/srv/releases")]
         await save("workspace", window, wait: 1.5)
         // The same in light: the terminals' palette and the cards follow the app's appearance together.
         NSApp.appearance = NSAppearance(named: .aqua)

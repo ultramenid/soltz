@@ -46,6 +46,7 @@ struct UnlockVaultView: View {
                 try await workspace.core.vaultUnlock(masterPassword: password)
                 workspace.vaultLocked = false
                 await workspace.reload()
+                workspace.reopenWorkspace()
             } catch VaultError.WrongKey {
                 failure = "That password is incorrect."
             } catch {

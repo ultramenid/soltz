@@ -61,6 +61,8 @@ final class Workspace {
     var dropSide: SplitPosition?
     /// The size the panes of a tab share on screen, for `place` to tell whether one more has room; zero until laid out.
     @ObservationIgnored var paneArea = CGSize.zero
+    /// Where the strip's "+" is in the window, top left first, for its menu opened from the keyboard (`askNewTab`).
+    @ObservationIgnored var plusFrame = CGRect.zero
     /// What the app's own drags did, for when one does nothing: kinds and outcomes, no names
     /// (`log show --predicate 'subsystem == "app.soltz"'`).
     static let drags = Logger(subsystem: "app.soltz", category: "drag")
@@ -81,6 +83,8 @@ final class Workspace {
         didSet { if font != oldValue { sessions.values.forEach { $0.setFont(font) } } }
     }
     private(set) var connections: [Connection] = []
+    /// What each host last said is live on it, by `liveKey` (`refreshLive`): every persistent session there.
+    var live: [String: [LiveSession]] = [:]
     private(set) var folders: [Folder] = []
     private(set) var identities: [Identity] = []
     private(set) var keys: [SshKey] = []
@@ -94,10 +98,15 @@ final class Workspace {
     @ObservationIgnored var networkUp: Bool?
     @ObservationIgnored var pathMonitor: NWPathMonitor?
     @ObservationIgnored var lastWakeAll: ContinuousClock.Instant?
+    /// Where the tabs are written down for the next launch; nil keeps none (tests).
+    @ObservationIgnored private let savedURL: URL?
+    /// The launch has reopened what was written down, so it may be written over.
+    @ObservationIgnored private var reopened = false
 
     /// A core keeping hosts, known hosts and the vault in `dataDir`, the vault's key in `keychain`.
     /// Without `dataDir` it runs sessions only and every storage call fails (tests).
     init(dataDir: URL? = nil, keychain: Keychain = .memory) {
+        savedURL = dataDir?.appending(path: "workspace.json")
         do {
             core = try dataDir.map { try Core.withDataDir(dataDir: $0.path(percentEncoded: false), keychain: keychain) } ?? Core()
         } catch {
@@ -134,6 +143,13 @@ final class Workspace {
         (tabs.flatMap(\.root.sessionIds) + floating).compactMap { sessions[$0] }.filter { self.key(ofSession: $0.id) == key }
     }
 
+    /// What the sidebar lists under a host: one row a tab, with the host's panes in it together, then each floating
+    /// one by itself.
+    func sessionRows(of key: String) -> [[TerminalSession]] {
+        let mine = { (ids: [String]) in ids.compactMap { self.sessions[$0] }.filter { self.key(ofSession: $0.id) == key } }
+        return tabs.map { mine($0.root.sessionIds) }.filter { !$0.isEmpty } + mine(floating).map { [$0] }
+    }
+
     /// Shows a host's tab, the one it showed last; nil, or a host without tabs, shows none. Sessions keep running
     /// either way.
     func show(_ key: String?) {
@@ -148,7 +164,7 @@ final class Workspace {
     }
 
     /// The tab now on screen says which host is shown, and is the one that host comes back to; with no tab, none is.
-    private func follow() {
+    func follow() {
         let tab = layout.splitTabs.first { $0.id == layout.activeSplitTabId }
         shown = tab.map(key(of:))
         if let tab, let shown { lastTab[shown] = tab.id }
@@ -415,6 +431,10 @@ final class Workspace {
     func newLocalTerminal(_ placement: Placement = .tab) {
         let session = TerminalSession(title: "Local", font: font)
         add(session, placement)
+        openLocal(session)
+    }
+
+    private func openLocal(_ session: TerminalSession) {
         Task {
             do {
                 session.attach(try await core.openLocalShell(sink: session.sink, cols: 80, rows: 24))
@@ -427,6 +447,13 @@ final class Workspace {
 
     /// Shows an opened (or opening) session and routes its keystrokes.
     func add(_ session: TerminalSession, _ placement: Placement = .tab) {
+        register(session)
+        place(session.id, placement)
+        focusActive()
+    }
+
+    /// Takes a session in and routes its keystrokes; the layout has, or is about to get, a pane for it.
+    private func register(_ session: TerminalSession) {
         sessions[session.id] = session
         session.onClosed = { [weak self, weak session] cleanExit in
             if let self, let session { sessionClosed(session, cleanExit: cleanExit) }
@@ -434,8 +461,81 @@ final class Workspace {
         Task { [weak self] in
             for await data in session.input { self?.route(data, from: session.id) }
         }
-        place(session.id, placement)
+    }
+
+    // MARK: - Reopening at launch
+
+    /// The tabs and panes as they are, for the next launch. A Quick Connect session is left out: its login is in
+    /// no vault, so nothing could open it again.
+    var saved: SavedWorkspace {
+        SavedWorkspace(layout: layout.snapshotLayout, floating: floating,
+                       panes: sessions.filter { $0.value.args == nil || $0.value.hostID != nil }.mapValues { session in
+                           .init(hostID: session.hostID, coreID: session.args?["persist"] == true ? session.coreID : nil,
+                                 title: session.title, files: session.showsFiles, path: session.filesPath)
+                       })
+    }
+
+    /// Written when the app is left and when it quits (`startNetworkWatch`), once the launch has reopened the last.
+    // shortcut: not on every change, so after a crash the tabs are those of when the app was last left; a session
+    // missed that way is still listed as live under its host. Write on every change if that bites.
+    func saveWorkspace() {
+        guard reopened, let savedURL, let data = try? JSONEncoder().encode(saved) else { return }
+        try? data.write(to: savedURL, options: .atomic)
+    }
+
+    /// Once, at launch, when the hosts are loaded and the vault is open: the tabs of last time (`reopen`).
+    func reopenWorkspace() {
+        guard !reopened, !vaultLocked else { return }
+        reopened = true
+        guard sessions.isEmpty, let savedURL, let data = try? Data(contentsOf: savedURL),
+              let saved = try? JSONDecoder().decode(SavedWorkspace.self, from: data) else { return }
+        reopen(saved)
+    }
+
+    /// Every tab and pane where it was. A terminal on a saved host attaches to the session it was, still running on
+    /// the host (its tab goes if that has ended); a files pane connects to its folder again; a local shell is a new
+    /// one. A pane whose host or login is gone is left out.
+    func reopen(_ saved: SavedWorkspace) {
+        layout.hydrate(saved.layout)
+        var connects: [(TerminalSession, JSONObject)] = []
+        for id in layout.splitTabs.flatMap(\.root.sessionIds) + saved.floating {
+            guard let pane = saved.panes[id], sessions[id] == nil else {
+                layout.removeSession(id)
+                continue
+            }
+            let session = TerminalSession(title: pane.title, font: font, id: id)
+            guard let hostID = pane.hostID else {
+                register(session)
+                openLocal(session)
+                continue
+            }
+            guard let host = connections.first(where: { $0.id == hostID }), let login = try? login(for: host),
+                  login.password != nil || login.privateKey != nil, var args = try? connectArgs(for: host, login: login) else {
+                layout.removeSession(id)
+                continue
+            }
+            if pane.files {
+                args = Self.forFiles(args)
+            } else if let coreID = pane.coreID, args["persist"] == true {
+                args = Self.forAttaching(args, to: coreID)
+            }
+            session.hostID = hostID
+            session.showsFiles = pane.files
+            session.filesPath = pane.path
+            session.args = args
+            register(session)
+            connects.append((session, args))
+        }
+        floating = saved.floating.filter { sessions[$0] != nil }
+        follow()
         focusActive()
+        // One after another: a dozen tabs on one host do not all handshake in the same instant.
+        Task {
+            for (session, args) in connects where sessions[session.id] != nil {
+                open(session, args)
+                try? await Task.sleep(for: .milliseconds(150))
+            }
+        }
     }
 
     /// A pane that would leave any pane of the tab under the least size (`Theme.paneLeast`) opens in a tab of its
@@ -467,7 +567,17 @@ final class Workspace {
         fileProviders.removeValue(forKey: sessionId)?.close() // upstream panelSftpStore `closeSession`
         session.answer(.abort, via: core) // a connect still asking about its host key gives up
         let live = session.isAttached && !session.ended && !session.showsFiles // a files pane ran no pre-command either
-        session.close(postCommand: connections.first { live && $0.id == session.hostID }.flatMap { inlineCommand($0, post: true) })
+        let closing = session.close(postCommand: connections.first { live && $0.id == session.hostID }.flatMap { inlineCommand($0, post: true) })
+        // Closing ends the session on the host. One whose connection had dropped could not be reached to end it:
+        // another connection of that host, if there is one, ends it. Then the host's list is read again.
+        let unreached = session.isAttached && !session.ended || session.args?["persist"] != true ? nil : session.coreID
+        if let key = liveKey(of: session) {
+            Task {
+                await closing.value
+                if let unreached { _ = try? await connectedSession(of: key)?.coreSession?.endLiveSession(sessionId: unreached) }
+                refreshLive(key)
+            }
+        }
     }
 
     // MARK: - Hosts
@@ -500,9 +610,68 @@ final class Workspace {
         }
     }
 
-    private func handleKey(_ event: NSEvent) -> Bool {
-        !event.modifierFlags.isDisjoint(with: [.command, .control]) && NSApp.mainMenu?.performKeyEquivalent(with: event) == true
+    func handleKey(_ event: NSEvent) -> Bool {
+        // Typing keeps ⇧⌘ with an arrow (select to the line's end, or the text's): the menu would open a pane instead.
+        if event.modifierFlags.isSuperset(of: [.command, .shift]), let text = event.window?.firstResponder as? NSText,
+           [.leftArrow, .rightArrow, .upArrow, .downArrow].contains(event.specialKey) {
+            text.keyDown(with: event)
+            return true
+        }
+        return !event.modifierFlags.isDisjoint(with: [.command, .control]) && NSApp.mainMenu?.performKeyEquivalent(with: event) == true
     }
+
+    // MARK: - New tab, asked from the keyboard
+
+    /// What "+" asks, the host's terminal or its files, as a menu the arrows and Return answer.
+    func newTabMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        for (title, symbol, files) in [("Terminal", "terminal", false), ("Files", TerminalSession.filesSymbol, true)] {
+            let action = MenuAction { [self] in files ? showFiles(for: activeSession) : duplicate(activeSession, .tab, files: false) }
+            let item = NSMenuItem(title: title, action: #selector(MenuAction.run), keyEquivalent: "")
+            item.target = action
+            item.representedObject = action // the item keeps it: a target is not retained
+            item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+            item.isEnabled = !files || activeSession?.args != nil // This Mac has terminals only
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    /// ⇧⌘+: that menu over "+"; with no tab on screen there is no host to ask about, so a local terminal.
+    func askNewTab() {
+        guard shown != nil, let view = NSApp.windows.first(where: { $0.identifier?.rawValue == "main" })?.contentView else {
+            return newLocalTerminal()
+        }
+        let menu = newTabMenu()
+        let top = plusFrame.minY - menu.size.height - 4
+        menu.popUp(positioning: nil, at: NSPoint(x: plusFrame.minX, y: view.isFlipped ? top : view.bounds.height - top), in: view)
+    }
+}
+
+private final class MenuAction: NSObject {
+    private let action: @MainActor () -> Void
+    init(_ action: @escaping @MainActor () -> Void) { self.action = action }
+    @MainActor @objc func run() { action() }
+}
+
+/// What a launch reopens: the layout and, for each pane, what opens it again. No secret is in it: a login is read
+/// from the vault when the pane connects.
+struct SavedWorkspace: Codable {
+    struct Pane: Codable {
+        /// The saved host it is on; nil for a local shell.
+        var hostID: String?
+        /// A persistent terminal's session on the host (`ssh_connect`'s `sessionId`), to attach to again.
+        var coreID: String?
+        var title: String
+        var files = false
+        var path = ""
+    }
+
+    var layout: SnapshotLayout
+    var floating: [String] = []
+    /// By the session id the layout names.
+    var panes: [String: Pane]
 }
 
 /// What the main window's alert says went wrong.

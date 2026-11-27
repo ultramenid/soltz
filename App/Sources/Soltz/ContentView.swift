@@ -84,6 +84,7 @@ struct ContentView: View {
             workspace.startNetworkWatch()
             await workspace.openVault()
             await workspace.reload()
+            workspace.reopenWorkspace()
             await workspace.updates.checkDaily()
             if Smoke.requested { await Smoke.run(workspace) }
             if E2E.requested { await E2E.run(workspace) }
@@ -582,7 +583,8 @@ private struct BottomBar: View {
                     .contentShape(.circle).glassEffect(.regular.interactive(), in: .circle)
             }
             .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
-            .help("New tab on this host, in the current directory: its terminal or its files")
+            .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { workspace.plusFrame = $0 }
+            .help("New tab on this host, in the current directory: its terminal or its files (⇧⌘+)")
             .accessibilityLabel("New Tab")
             .overlay { if atEnd { Circle().strokeBorder(.tint, lineWidth: 2).allowsHitTesting(false).transition(.opacity) } }
             .animation(Theme.motion, value: atEnd)
@@ -619,7 +621,7 @@ struct NewTabItems: View {
 
     var body: some View {
         Button("Terminal", systemImage: "terminal", action: terminal)
-        Button("Files", systemImage: "folder") { files?() }.disabled(files == nil)
+        Button("Files", systemImage: TerminalSession.filesSymbol) { files?() }.disabled(files == nil)
     }
 }
 

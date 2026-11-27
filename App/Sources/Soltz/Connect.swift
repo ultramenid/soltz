@@ -232,6 +232,13 @@ extension Workspace {
         return args
     }
 
+    /// A connection to a session live on the host already, one joined or one a launch reopens: only ever attached
+    /// to, as it is, so no directory is set and the host's pre-command, written for a new shell, is not typed into it.
+    static func forAttaching(_ args: JSONObject, to sessionID: String) -> JSONObject {
+        args.merging(["sessionId": .string(sessionID), "attachOnly": true, "persist": true, "initialCwd": .null,
+                      "preCommand": .null]) { $1 }
+    }
+
     /// Connects `session` in its pane; Cancel (`connectTask`) stops it. A failure is reported and leaves the pane
     /// ended, offering Reconnect (`failed`).
     func open(_ session: TerminalSession, _ args: JSONObject) {
@@ -279,6 +286,7 @@ extension Workspace {
     /// After a first connect, `last_used_at` is stamped. The lists reload after every connect, a Reconnect too, so a
     /// host key the connect trusted or replaced shows on the Known Hosts page.
     func connected(_ session: TerminalSession, first: Bool = true) async {
+        if let key = liveKey(of: session) { refreshLive(key) }
         guard let host = connections.first(where: { $0.id == session.hostID }) else { return await reload() }
         guard first else { return await reload() }
         await perform("Couldn’t Save the Host") { try await markUsed(host.id) }
@@ -290,7 +298,8 @@ extension Workspace {
     /// Another session like `source`, upstream's "Duplicate in split" (src/services/duplicateSession.ts:46): a second
     /// connection to the same host, in the session's directory; for a local shell, or none, a local shell. It shows
     /// what `source` shows, its terminal or its files, unless `files` says which.
-    func duplicate(_ source: TerminalSession?, _ placement: Placement, files: Bool? = nil) {
+    /// With `joining` it is no new session but that one, live on the host already (`forAttaching`).
+    func duplicate(_ source: TerminalSession?, _ placement: Placement, files: Bool? = nil, joining: LiveSession? = nil) {
         guard let source, source.args != nil else { return newLocalTerminal(placement) }
         // The host's login and its way in (proxy, jump hosts, knock) are read again. A session whose saved host was
         // deleted since has neither left (`connectSsh` wiped them): it is refused rather than dialled directly.
@@ -312,12 +321,77 @@ extension Workspace {
         args["sessionId"] = .string(Self.newSessionID())
         args["attachOnly"] = .null
         args["initialCwd"] = nullable(folder.isEmpty ? nil : folder)
+        if let joining { args = Self.forAttaching(args, to: joining.sessionId) }
         let session = TerminalSession(title: source.title, font: font)
         session.hostID = source.hostID
         session.showsFiles = files ?? source.showsFiles
         session.filesPath = folder
         add(session, placement)
         open(session, args)
+    }
+
+    // MARK: - Live on the host
+
+    /// What a session's host is known by in `live`: a saved host's id, or for Quick Connect its address; nil for a
+    /// local shell.
+    func liveKey(of session: TerminalSession) -> String? {
+        guard let args = session.args else { return nil }
+        return session.hostID ?? "\(Self.quick)\(args["username"]?.string ?? "")@\(args["host"]?.string ?? "")"
+    }
+
+    /// What starts a Quick Connect host's key in `live`; the rest is what it is called, `user@host`.
+    nonisolated static let quick = "quick:"
+
+    /// A host's connected session: what the host is asked over, and what a join's connection is made like.
+    func connectedSession(of key: String) -> TerminalSession? {
+        sessions.values.first { liveKey(of: $0) == key && $0.isAttached && !$0.ended }
+    }
+
+    /// The persistent sessions on a sidebar row's host that are not open here, newest first: another device's, or
+    /// this Mac's from before it quit. Read from the host itself, so nothing is synced and nothing leaves this Mac.
+    /// This Mac's row has those of the Quick Connect hosts, whose sessions it lists.
+    func liveRows(of row: String) -> [LiveRow] {
+        let open = Set(sessions.values.compactMap(\.coreID))
+        let keys = row == Self.thisMac ? live.keys.filter { $0.hasPrefix(Self.quick) }.sorted() : [row]
+        return keys.flatMap { key in
+            (live[key] ?? []).filter { !open.contains($0.sessionId) }.sorted { $0.created > $1.created }
+                .map { LiveRow(key: key, session: $0) }
+        }
+    }
+
+    /// The live row of that id, while it is listed.
+    func liveRow(_ id: String) -> LiveRow? {
+        live.keys.lazy.flatMap { self.liveRows(of: $0.hasPrefix(Self.quick) ? Self.thisMac : $0) }.first { $0.id == id }
+    }
+
+    /// Asks the host of `key`, or every host with a session, what is live on it: after a connect, after a close,
+    /// and when the app comes to the front. A host with no connection left lists nothing; one that does not answer
+    /// keeps what it listed.
+    func refreshLive(_ key: String? = nil) {
+        for key in key.map({ [$0] }) ?? Array(Set(sessions.values.compactMap(liveKey)).union(live.keys)) {
+            guard let via = connectedSession(of: key)?.coreSession else {
+                live[key] = nil
+                continue
+            }
+            Task { if let found = try? await via.liveSessions() { live[key] = found } }
+        }
+    }
+
+    /// A tab on a session live on the host: the same shell and scrollback, shared with whoever else has it open
+    /// until one of them closes it, which ends it for all.
+    func join(_ row: LiveRow) {
+        duplicate(connectedSession(of: row.key), .tab, files: false, joining: row.session)
+    }
+
+    /// Ends a session live on the host without opening it, whoever has it open.
+    func endLive(_ row: LiveRow) {
+        guard let via = connectedSession(of: row.key)?.coreSession else { return }
+        Task {
+            if (try? await via.endLiveSession(sessionId: row.session.sessionId)) != true {
+                failure = Failure(title: "Couldn’t End the Session", message: "The host did not confirm that it ended.")
+            }
+            refreshLive(row.key)
+        }
     }
 
     /// Upstream `persistConnectAuth` (src/stores/sessionStore.ts:529), Quick Connect's "save to host": the username
@@ -357,6 +431,16 @@ extension Workspace {
         default: type.rawValue
         }
     }
+}
+
+/// A session live on a host and not open here, as the sidebar lists it under `key`'s host.
+struct LiveRow: Identifiable {
+    /// The host's key in `Workspace.live`.
+    let key: String
+    let session: LiveSession
+    var id: String { "live:\(key):\(session.sessionId)" }
+    /// A Quick Connect host's `user@host`: its rows are under This Mac, which is no name for it.
+    var host: String? { key.hasPrefix(Workspace.quick) ? String(key.dropFirst(Workspace.quick.count)) : nil }
 }
 
 /// `value` as a JSON string, or null.

@@ -33,7 +33,8 @@ final class TerminalSession {
         var size: (cols: UInt16, rows: UInt16)?
     }
 
-    nonisolated let id = UUID().uuidString
+    /// What the layout names it by; a launch reopens it under the id it had (`Workspace.reopen`).
+    nonisolated let id: String
     @ObservationIgnored let terminal: SoltzTerminalModel
     /// Keystrokes and terminal replies, for the workspace to route.
     @ObservationIgnored let input: AsyncStream<Data>
@@ -61,9 +62,9 @@ final class TerminalSession {
     var showsFiles = false
     /// The folder a files pane shows; empty opens the host's home.
     var filesPath = ""
-    /// What marks a files session in the sidebar, on its tab and in its pane: a drive on a network, not the folder
-    /// a group of hosts has.
-    static let filesSymbol = "externaldrive.connected.to.line.below"
+    /// What marks a files session in the sidebar, on its tab and in its pane: a list in the frame the terminal's
+    /// prompt is in, not the folder a group of hosts has.
+    static let filesSymbol = "list.bullet.rectangle"
     /// The connect in flight; cancelling it cancels the connect.
     @ObservationIgnored var connectTask: Task<Void, Never>?
     /// It was connected once: a persistent session's Reconnect then only attaches (`attachOnly`).
@@ -87,7 +88,8 @@ final class TerminalSession {
     @ObservationIgnored private let outbox: AsyncStream<Outgoing>.Continuation
     @ObservationIgnored private let typed: AsyncStream<Data>.Continuation
 
-    init(title: String, font: TerminalFont) {
+    init(title: String, font: TerminalFont, id: String = UUID().uuidString) {
+        self.id = id
         let (outgoing, outbox) = AsyncStream.makeStream(of: Outgoing.self)
         let (input, typed) = AsyncStream.makeStream(of: Data.self)
         let link = OSAllocatedUnfairLock(initialState: Link())
@@ -162,6 +164,9 @@ final class TerminalSession {
         }
     }
 
+    /// The core session while connected: what the host is asked over (`Workspace.refreshLive`).
+    var coreSession: Session? { link.withLock { $0.session } }
+
     /// Answers the changed-host-key question, if one is waiting.
     func answer(_ action: HostKeyAction, via core: Core) {
         guard let conflict else { return }
@@ -187,8 +192,11 @@ final class TerminalSession {
     /// Ends the core session (its sink then gets no `closed`) and both streams, and cancels a connect in flight.
     /// A live SSH session ends as upstream closes its tab (`ssh_disconnect`, src/stores/sessionStore.ts:826):
     /// `postCommand` first, then its tmux session killed. A dropped one is only closed, so its tmux session stays
-    /// detached until the TTL, as in upstream.
-    func close(postCommand: String? = nil) {
+    /// detached until the TTL, as in upstream (`Workspace.end` ends it over another connection of the host, if there
+    /// is one). Closing ends the session for every device that has it open: the core's own close leaves one another
+    /// client is attached to, so it is ended first. The task ends once the host has answered.
+    @discardableResult
+    func close(postCommand: String? = nil) -> Task<Void, Never> {
         isClosed = true
         connectTask?.cancel()
         outbox.finish()
@@ -198,12 +206,14 @@ final class TerminalSession {
             return link.session
         }
         let live = args != nil && !ended
-        Task {
+        let persistent = args?["persist"] == true ? coreID : nil
+        return Task {
             guard let session else { return }
             guard live else {
                 try? await session.close()
                 return
             }
+            if let persistent { _ = try? await session.endLiveSession(sessionId: persistent) }
             _ = try? await session.disconnect(postCommand: postCommand, killPersistent: true, attached: true)
         }
     }

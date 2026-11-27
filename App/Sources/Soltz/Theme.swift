@@ -45,6 +45,9 @@ enum Theme {
     static let treeIndent: CGFloat = 16         // one level in: a group's hosts, a host's sessions
     static let treeSlot: CGFloat = 14           // a row's chevron
     static let treeIcon: CGFloat = 18           // and its icon
+    static let stackMost = 2                    // the cards that show under a row's icon, at most
+    static let stackRise: CGFloat = 2.5         // how far each is above, and narrower than, the one over it
+    static let stackLine: CGFloat = 1.2         // and how thick its edge is drawn: the symbol's own stroke
     static let cardRadius: CGFloat = 22         // 12.5 px
     static let cardInset: CGFloat = 23          // text from the card edge, 13 px
     static let rowInset: CGFloat = 11           // selection pill from the card edge, 6.3 px

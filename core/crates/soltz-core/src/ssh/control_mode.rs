@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const MARKER: &[u8] = b"\x1bP1000p";
 const RAW_SENTINEL: &[u8] = b"\x1bP1000r\x1b\\";
@@ -239,6 +240,18 @@ pub fn encode_resize(cols: u32, rows: u32) -> String {
     format!("refresh-client -C {cols}x{rows}\n")
 }
 
+/// Gives the session's window this client's size, whatever other clients are
+/// attached: the device in use shows it at its own size and the others mirror
+/// it. (`window-size latest` does not do this for control clients: tmux 3.4
+/// keeps one client's size whoever types.) It sets `window-size manual` on
+/// that window alone.
+pub fn take_size_command(key: &str, cols: u32, rows: u32) -> String {
+    format!("resize-window -t {key} -x {cols} -y {rows}\n")
+}
+
+/// How long after this client's last typing a keystroke takes the size again.
+const TAKE_AFTER: Duration = Duration::from_secs(3);
+
 pub fn window_style_command(target: &str, colors: &TerminalColors) -> String {
     format!(
         "set -p -t {target} window-style 'fg={},bg={}'\n",
@@ -327,7 +340,8 @@ pub fn sync_command(
 ) -> (String, Vec<ReplyKind>) {
     let mut cmds = vec![
         (encode_resize(cols, rows), ReplyKind::Ignore),
-        ("set -g window-size smallest".to_string(), ReplyKind::Ignore),
+        // Attaching is sitting down at this device.
+        (take_size_command(key, cols, rows), ReplyKind::Ignore),
     ];
     if let Some(c) = colors {
         cmds.push((window_style_command(key, c), ReplyKind::Ignore));
@@ -472,6 +486,8 @@ pub struct ControlSession {
     snapshot: Option<Snapshot>,
     pane: Option<String>,
     osc7: Arc<AtomicBool>,
+    /// When this client last typed (or attached).
+    typed: Instant,
 }
 
 impl ControlSession {
@@ -487,6 +503,7 @@ impl ControlSession {
             snapshot: None,
             pane: None,
             osc7: Arc::new(AtomicBool::new(false)),
+            typed: Instant::now(),
         }
     }
 
@@ -622,7 +639,20 @@ impl ControlSession {
                 Vec::new()
             }
             Phase::Raw => vec![Action::Send(data)],
-            Phase::Control => self.send_keys(&data),
+            Phase::Control => {
+                let mut actions = Vec::new();
+                // Typing, not the terminal answering a program: those answers start with ESC, and a device
+                // nobody is at sends them too.
+                if data.first().is_some_and(|b| *b != 0x1b) {
+                    if self.typed.elapsed() > TAKE_AFTER {
+                        let take = take_size_command(&self.key, self.cols, self.rows);
+                        actions.push(self.command(take));
+                    }
+                    self.typed = Instant::now();
+                }
+                actions.extend(self.send_keys(&data));
+                actions
+            }
         }
     }
 
@@ -630,7 +660,10 @@ impl ControlSession {
         self.cols = cols;
         self.rows = rows;
         match self.phase {
-            Phase::Control => vec![self.command(encode_resize(cols, rows))],
+            Phase::Control => {
+                let take = take_size_command(&self.key, cols, rows);
+                vec![self.command(encode_resize(cols, rows)), self.command(take)]
+            }
             _ => vec![Action::WindowChange(cols, rows)],
         }
     }
@@ -912,7 +945,7 @@ mod tests {
         let cmds: Vec<&str> = line.trim_end().split(" ; ").collect();
         assert_eq!(cmds.len(), kinds.len());
         assert_eq!(cmds[0], "refresh-client -C 100x30");
-        assert_eq!(cmds[1], "set -g window-size smallest");
+        assert_eq!(cmds[1], "resize-window -t soltz_s1 -x 100 -y 30");
         assert!(cmds[2].starts_with("set -p -t soltz_s1 window-style"));
         assert_eq!(
             cmds[3],
@@ -1233,7 +1266,10 @@ mod tests {
         );
         assert_eq!(
             s.on_resize(120, 40),
-            vec![Action::Send(b"refresh-client -C 120x40\n".to_vec())]
+            vec![
+                Action::Send(b"refresh-client -C 120x40\n".to_vec()),
+                Action::Send(b"resize-window -t soltz_s1 -x 120 -y 40\n".to_vec()),
+            ]
         );
         assert_eq!(
             s.on_colors(colors()),

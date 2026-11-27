@@ -6,12 +6,13 @@ import SoltzFilesUI
 import SoltzHostsUI
 import SoltzKeychainUI
 import SoltzModel
+import SoltzWorkspace
 
 // Test harness: compiled only into SoltzTest.app (SOLTZ_HARNESS, scripts/bundle-app.sh). See Harness.swift.
 #if SOLTZ_HARNESS
 
 /// `--smoke`: drives the real window and Rust core, prints one `[PASS]`/`[FAIL]` line per check
-/// and exits 0 (all passed) or 1, within 10 seconds.
+/// and exits 0 (all passed) or 1, within 20 seconds.
 @MainActor
 enum Smoke {
     static let requested = CommandLine.arguments.contains("--smoke")
@@ -20,8 +21,8 @@ enum Smoke {
 
     nonisolated static func startWatchdog() {
         Thread.detachNewThread {
-            Thread.sleep(forTimeInterval: 15) // the window checks animate a resize three times
-            print("[FAIL] watchdog: smoke run did not finish within 15 s")
+            Thread.sleep(forTimeInterval: 20) // the window checks animate a resize three times; a run takes 13 s
+            print("[FAIL] watchdog: smoke run did not finish within 20 s")
             exit(1)
         }
     }
@@ -72,10 +73,27 @@ enum Smoke {
             workspace.closeAll()
         }
 
+        // A launch reopens the tabs of last time (`Workspace.reopen`): read back as a launch reads them, from JSON.
+        workspace.newLocalTerminal()
+        workspace.newLocalTerminal(.right)
+        workspace.newLocalTerminal()
+        let kept = workspace.tabs.first?.id, gone = workspace.activeSession?.id ?? ""
+        var saved = workspace.saved
+        saved.panes[gone]?.hostID = "a-host-no-longer-saved"
+        let read = (try? JSONEncoder().encode(saved)).flatMap { try? JSONDecoder().decode(SavedWorkspace.self, from: $0) }
+        workspace.closeAll()
+        if let read { workspace.reopen(read) }
+        let back = await wait { workspace.sessions.count == 2 && workspace.sessions.values.allSatisfy(\.isAttached) }
+        check("a launch reopens the tabs of last time, each pane where it was, without the pane whose host is gone",
+              back && workspace.tabs.map(\.id) == [kept] && workspace.layout.root?.leaves.count == 2 && workspace.sessions[gone] == nil,
+              "tabs \(workspace.tabs.count), sessions \(workspace.sessions.count), panes \(workspace.layout.root?.leaves.count ?? 0)")
+        workspace.closeAll()
+
         await storage(workspace, check)
         await home(workspace, check)
         await keychain(workspace, check)
         await files(workspace, check)
+        await keys(workspace, check)
         await titleBar(check)
         await strayClick(workspace, check)
 
@@ -602,6 +620,77 @@ enum Smoke {
         let dismissed = await wait(0.5) { workspace.failure == nil || sheet.sheetParent == nil }
         check("a stray click on an alert's button during a test run is dropped: the alert and its error stay",
               !dismissed, "button “\(button.title)”")
+    }
+
+    /// ⇧⌘ with an arrow and ⇧⌘+, each key handed to the menu bar as the app's key monitor hands it.
+    private static func keys(_ workspace: Workspace, _ check: (String, Bool, String) -> Void) async {
+        guard let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "main" }), let content = window.contentView else {
+            return check("⇧⌘ with an arrow opens a pane on that side", false, "no window")
+        }
+        func press(_ characters: String, _ code: UInt16, _ flags: NSEvent.ModifierFlags) -> Bool {
+            // A test run is not the active app, whose menus the system brings up to date before a key: done here.
+            for menu in NSApp.mainMenu?.items.compactMap(\.submenu) ?? [] { menu.delegate?.menuNeedsUpdate?(menu) }
+            return NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime,
+                             windowNumber: window.windowNumber, context: nil, characters: characters,
+                             charactersIgnoringModifiers: characters, isARepeat: false, keyCode: code).map(workspace.handleKey) ?? false
+        }
+        func arrow(_ key: NSEvent.SpecialKey, _ code: UInt16) -> Bool {
+            press(String(key.unicodeScalar), code, [.command, .shift, .numericPad, .function])
+        }
+        var wrong: [String] = []
+        let arrows: [(String, NSEvent.SpecialKey, UInt16, (CGRect, CGRect) -> Bool)] = [
+            ("right", .rightArrow, 124, { $0.minX >= $1.maxX }), ("left", .leftArrow, 123, { $0.maxX <= $1.minX }),
+            ("above", .upArrow, 126, { $0.maxY <= $1.minY }), ("below", .downArrow, 125, { $0.minY >= $1.maxY }),
+        ]
+        for (name, key, code, placed) in arrows {
+            workspace.closeAll()
+            workspace.newLocalTerminal()
+            let first = workspace.activeSession
+            let taken = arrow(key, code)
+            _ = await wait { workspace.layout.root?.leaves.count == 2 } // a menu's action runs a moment after its key
+            let frames = workspace.layout.root.map { PaneLayout($0, in: CGRect(x: 0, y: 0, width: 100, height: 100)).panes } ?? []
+            func frame(_ session: TerminalSession?) -> CGRect? { frames.first { $0.leaf.sessionId == session?.id }?.frame }
+            if let new = frame(workspace.activeSession), let old = frame(first), taken, frames.count == 2, placed(new, old) { continue }
+            wrong.append(name)
+        }
+        check("⇧⌘ with an arrow opens a pane on that side of the active one: right, left, above, below", wrong.isEmpty,
+              wrong.joined(separator: ", "))
+        // In a text field the chord is the field's: the text is selected to the start of its line, no pane opens.
+        let text = NSTextView(frame: NSRect(x: 0, y: 0, width: 200, height: 20))
+        text.string = "soltz"
+        content.addSubview(text)
+        window.makeFirstResponder(text)
+        let panes = workspace.layout.root?.leaves.count
+        let typed = arrow(.leftArrow, 123)
+        check("⇧⌘← in a text field selects to the start of the line and opens no pane",
+              typed && text.selectedRange() == NSRange(location: 0, length: 5) && workspace.layout.root?.leaves.count == panes,
+              "selection \(text.selectedRange())")
+        text.removeFromSuperview()
+        // ⇧⌘+ asks what "+" asks, in a menu: closed here as soon as it opens, as nothing can answer it.
+        nonisolated(unsafe) var asked: [[String]] = []
+        let watch = NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: nil) { note in
+            nonisolated(unsafe) let menu = note.object as? NSMenu
+            // A turn later: a menu told to close as it opens stays open.
+            RunLoop.main.perform(inModes: [.eventTracking, .common]) {
+                MainActor.assumeIsolated {
+                    guard let menu else { return }
+                    asked.append(menu.items.map(\.title))
+                    menu.cancelTrackingWithoutAnimation()
+                }
+            }
+        }
+        let plus = press("+", 24, [.command, .shift]), plain = press("=", 24, .command)
+        NotificationCenter.default.removeObserver(watch)
+        let tabs = workspace.layout.splitTabs.count
+        let menu = workspace.newTabMenu()
+        menu.performActionForItem(at: 0)
+        check("⇧⌘+ asks Terminal or Files as “+” does (This Mac has no Files), ⌘= does not; Terminal opens a tab",
+              plus && !plain && asked == [["Terminal", "Files"]] && menu.items.map(\.isEnabled) == [true, false]
+                  && workspace.layout.splitTabs.count == tabs + 1,
+              "asked \(asked), ⌘= taken: \(plain), “+” at \(workspace.plusFrame)")
+        workspace.closeAll()
+        check("⇧⌘+ with no tab on screen opens a local terminal", press("+", 24, [.command, .shift]) && workspace.layout.splitTabs.count == 1, "")
+        workspace.closeAll()
     }
 
     /// Every table in the app's windows (the panes are SwiftUI `Table`s).

@@ -957,6 +957,67 @@ pub fn force_kill_command(session_id: &str) -> String {
     persistent_kill_command(&tmux_session_key(session_id), FORCE_KILL_CLIENTS)
 }
 
+/// A persistent session found on the host: this app's on another device, or one
+/// this device left running.
+#[derive(uniffi::Record, Debug, PartialEq)]
+pub struct LiveSession {
+    /// What `ssh_connect` attaches to it under (`sessionId`, with `attachOnly`).
+    pub session_id: String,
+    /// Clients attached to it now.
+    pub clients: u32,
+    /// When it was started, in seconds since 1970; 0 when the host does not say.
+    pub created: u64,
+    pub cwd: Option<String>,
+}
+
+/// One-shot exec listing the host's persistent sessions, one a line: name,
+/// attached clients, creation time and working directory, space-separated
+/// (tmux prints a tab as `_`). tmux first, as `persistent_exec_command` picks
+/// it; GNU screen says neither when a session started nor where it is, so those
+/// are 0 and absent. Prints nothing when there is neither.
+pub fn persistent_list_command() -> String {
+    let script = format!(
+        r#"if command -v tmux >/dev/null 2>&1; then
+  tmux -L {TMUX_SOCKET} list-sessions -F '#{{session_name}} #{{session_attached}} #{{session_created}} #{{pane_current_path}}' 2>/dev/null
+elif command -v screen >/dev/null 2>&1; then
+  screen -ls 2>/dev/null | awk '$1 ~ /^[0-9]+[.]/ {{ n = $1; sub(/^[0-9]+[.]/, "", n); print n, ($0 ~ /ttached/ ? 1 : 0), 0 }}'
+fi
+true"#
+    );
+    encode_wrapper(&script)
+}
+
+/// Whether `id` is a session id of this app's, plain enough to go into a shell
+/// command as it is.
+pub fn is_session_id(id: &str) -> bool {
+    id.starts_with("soltz-") && tmux_session_key(id) == format!("soltz_{id}")
+}
+
+/// What [`persistent_list_command`] printed. The names come from the host, and
+/// one of them goes back into a shell command when it is attached to: only a
+/// name that is exactly what this app gives a session counts.
+pub fn parse_live_sessions(listing: &str) -> Vec<LiveSession> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(4, ' ');
+            let id = fields.next()?.strip_prefix("soltz_")?;
+            if !is_session_id(id) {
+                return None;
+            }
+            Some(LiveSession {
+                session_id: id.to_string(),
+                clients: fields.next()?.parse().ok()?,
+                created: fields.next()?.parse().ok()?,
+                cwd: fields
+                    .next()
+                    .filter(|p| p.starts_with('/') && !p.chars().any(char::is_control))
+                    .map(str::to_string),
+            })
+        })
+        .collect()
+}
+
 /// Same shape as `ssh_exec_command` but encodes the WSL-flavored wrapper,
 /// which emits OSC 7 with the distro name so the frontend can route the
 /// panel to a `\\wsl.localhost\<distro>\` UNC path.

@@ -206,7 +206,7 @@ extension Workspace {
             throw ConnectProblem("This session has nothing to reconnect.")
         }
         args["sessionId"] = opened["sessionId"]
-        args["attachOnly"] = .bool(session.everConnected && opened["persist"] == .bool(true))
+        args["attachOnly"] = .bool((session.everConnected || opened["attachOnly"] == true) && opened["persist"] == .bool(true))
         args["initialCwd"] = .null
         session.reconnectAttempts += 1
         try await connectSsh(session, args)
@@ -242,8 +242,17 @@ extension Workspace {
         }
         monitor.start(queue: .main)
         pathMonitor = monitor
+        // Left or quit: the tabs are written down for the next launch.
+        for left in [NSApplication.didResignActiveNotification, NSApplication.willTerminateNotification] {
+            NotificationCenter.default.addObserver(forName: left, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.saveWorkspace() }
+            }
+        }
         NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.wakeAllBackoffs() }
+            MainActor.assumeIsolated {
+                self?.wakeAllBackoffs()
+                self?.refreshLive() // sitting down at this Mac: what the other one left open
+            }
         }
     }
 

@@ -136,6 +136,29 @@ impl SessionManager {
         Some(start.elapsed().as_millis() as u32)
     }
 
+    /// The persistent sessions on the host `id` is connected to, its own among them.
+    pub async fn live_sessions(
+        &self,
+        id: &str,
+    ) -> Result<Vec<crate::shell_integration::LiveSession>, String> {
+        let handle = self.get_handle(id).await?;
+        let list = crate::shell_integration::persistent_list_command();
+        let out = stdout_within(&handle, &list, Duration::from_secs(5)).await?;
+        Ok(crate::shell_integration::parse_live_sessions(&out))
+    }
+
+    /// Ends a persistent session on `id`'s host that this device is not attached
+    /// to, whoever else is. Whether the host confirmed it.
+    pub async fn end_live(&self, id: &str, live_id: &str) -> Result<bool, String> {
+        if !crate::shell_integration::is_session_id(live_id) {
+            return Err("Not a Soltz session's id".into());
+        }
+        let handle = self.get_handle(id).await?;
+        let kill = crate::shell_integration::force_kill_command(live_id);
+        let out = stdout_within(&handle, &kill, Duration::from_secs(5)).await?;
+        Ok(out.contains("SOLTZ_KILLED"))
+    }
+
     pub async fn detect_distro(&self, id: &str) -> Result<String, String> {
         let platform = self.with_session(id, |s| s.platform).await?;
         detect_distro(&self.get_machine(id).await?, platform).await

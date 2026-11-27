@@ -342,7 +342,10 @@ impl russh::server::Handler for Conn {
             self.staging.insert(channel);
             return Ok(());
         }
-        let out = if cmd.contains("pane_current_path") {
+        let out = if cmd.contains("list-sessions") {
+            // One of Soltz's, open on another device, and a name that is not one of its sessions.
+            "soltz_soltz-elsewhere 1 1700000000 /srv/my app\nsoltz_$(reboot) 0 1 /\n".into()
+        } else if cmd.contains("pane_current_path") {
             format!("{PROBED_CWD}\n")
         } else if cmd.contains("SOLTZ_KILLED") {
             seen.killed = true;

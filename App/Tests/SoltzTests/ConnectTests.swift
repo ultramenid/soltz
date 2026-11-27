@@ -31,6 +31,13 @@ import Testing
         }
     }
 
+    @Test func joiningALiveSessionOnlyAttachesAndTypesNothing() {
+        let args = Workspace.forAttaching(["sessionId": "soltz-new", "persist": false, "preCommand": "cd /srv", "initialCwd": "/tmp",
+                                           "host": "10.0.4.11"], to: "soltz-elsewhere")
+        #expect(args["sessionId"] == "soltz-elsewhere" && args["attachOnly"] == true && args["persist"] == true)
+        #expect(args["preCommand"] == .null && args["initialCwd"] == .null && args["host"] == "10.0.4.11")
+    }
+
     @Test func knockSequencesParseAsUpstreamDoes() {
         #expect(Workspace.knockSteps("7000/tcp, 8000/udp,9000") == [
             ["port": 7000, "protocol": "tcp"], ["port": 8000, "protocol": "udp"], ["port": 9000, "protocol": "tcp"],

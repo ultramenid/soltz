@@ -167,6 +167,9 @@ struct SoltzCommands: Commands {
                 if inWorkspace { workspace.duplicate(workspace.activeSession, .tab, files: false) } else { workspace.newLocalTerminal() }
             }
             .keyboardShortcut(shortcuts.keyboardShortcut("new-tab"))
+            // What "+" asks, from the keyboard.
+            Button("New Session…") { workspace.askNewTab() }
+                .keyboardShortcut("+", modifiers: [.command, .shift])
             Button("New Files Tab") { workspace.showFiles(for: workspace.shownSession) }
                 .disabled(workspace.shownSession?.args == nil)
             Button("New Local Terminal") { workspace.newLocalTerminal() }
@@ -194,6 +197,11 @@ struct SoltzCommands: Commands {
                 // ⇧⌘D is ShortcutStore's unbound "duplicate-session"; ⌥⌘D belongs to the Dock.
                 Button("Split Down") { workspace.split(.below) }
                     .keyboardShortcut("d", modifiers: [.command, .shift])
+                // ⇧⌘ and an arrow: a new pane on that side of the active one.
+                Button("New Pane Right") { workspace.split(.right) }.keyboardShortcut(.rightArrow, modifiers: [.command, .shift])
+                Button("New Pane Left") { workspace.split(.beside(.left)) }.keyboardShortcut(.leftArrow, modifiers: [.command, .shift])
+                Button("New Pane Above") { workspace.split(.beside(.top)) }.keyboardShortcut(.upArrow, modifiers: [.command, .shift])
+                Button("New Pane Below") { workspace.split(.below) }.keyboardShortcut(.downArrow, modifiers: [.command, .shift])
                 Button(workspace.layout.maximizedPaneId == nil ? "Maximize Pane" : "Restore Pane") { workspace.toggleMaximize() }
                     .keyboardShortcut(.return, modifiers: [.command, .shift])
                     .disabled((workspace.layout.root?.leaves.count ?? 0) < 2)
