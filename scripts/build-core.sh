@@ -15,6 +15,8 @@ lib="$crate/target/$target/release/libsoltz_core.a"
 xcframework="$pkg/SoltzCoreFFI.xcframework"
 
 cd "$crate"
+# The builder's home folder (their user name) stays out of the app: rustc records source paths for panic messages.
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=~"
 # --locked: exactly the dependency versions in Cargo.lock, or the build stops.
 cargo rustc --locked --release --lib --crate-type staticlib --target "$target"
 cargo build --locked --features bindgen --bin uniffi-bindgen-swift
