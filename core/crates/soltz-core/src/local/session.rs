@@ -1,0 +1,301 @@
+use crate::local::flatpak;
+use crate::shell_integration;
+use crate::terminal_output::{emit_closed, emit_output, SessionApp};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync;
+
+pub struct LocalSession {
+    pub input_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    pub master: SharedMaster,
+    pub child: SharedChild,
+    pub tempfiles: Vec<PathBuf>,
+}
+
+type SharedChild = Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>;
+type SharedMaster = Arc<Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>>;
+
+const EXIT_REAP_WAIT: Duration = Duration::from_secs(2);
+
+// The pty can hit EOF just before the child is reaped; an unknown status counts
+// as unclean so the tab stays open with whatever the shell printed.
+pub(crate) fn exited_cleanly(child: &SharedChild, wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        match child.lock().unwrap().try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => {}
+            _ => return false,
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+// ConPTY keeps the output pipe open after the shell exits, so the reader never
+// sees EOF until the pseudoconsole is closed by dropping the master.
+#[cfg(windows)]
+fn close_console_on_exit(child: &SharedChild, master: SharedMaster) {
+    use std::os::windows::io::{AsRawHandle, BorrowedHandle};
+    use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+    let Some(raw) = child.lock().unwrap().as_raw_handle() else {
+        return;
+    };
+    let Ok(process) = unsafe { BorrowedHandle::borrow_raw(raw) }.try_clone_to_owned() else {
+        return;
+    };
+    std::thread::spawn(move || {
+        unsafe { WaitForSingleObject(process.as_raw_handle() as _, INFINITE) };
+        master.lock().unwrap().take();
+    });
+}
+
+pub struct LocalSessionManager {
+    sessions: Arc<sync::Mutex<HashMap<String, LocalSession>>>,
+}
+
+/// Boot the default WSL distro before attaching so an interactive session doesn't
+/// race its cold start. Runs hidden (no console window) and ignores failures and hangs.
+#[cfg(windows)]
+async fn prewarm_wsl(wsl_path: &str) {
+    use crate::commands::{win_proc, wsl};
+    let mut cmd = tokio::process::Command::new(wsl_path);
+    cmd.args(["--", "true"]);
+    win_proc::prevent_visible_child_window(&mut cmd);
+    wsl::output_within(cmd, wsl::BOOT_TIMEOUT).await;
+}
+
+impl LocalSessionManager {
+    pub fn new() -> Self {
+        Self {
+            sessions: Arc::new(sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub async fn spawn(
+        &self,
+        app: impl SessionApp,
+        session_id: String,
+        cols: u16,
+        rows: u16,
+        shell: Option<String>,
+        cwd: Option<String>,
+        shell_integration_enabled: bool,
+    ) -> Result<(), String> {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| format!("Failed to open PTY: {e}"))?;
+
+        let shell = shell.unwrap_or_else(|| {
+            #[cfg(windows)]
+            {
+                std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
+            }
+            #[cfg(not(windows))]
+            {
+                flatpak::spawns_on_host()
+                    .then(flatpak::host_login_shell)
+                    .flatten()
+                    .or_else(|| std::env::var("SHELL").ok())
+                    .unwrap_or_else(|| "/bin/bash".to_string())
+            }
+        });
+
+        // A Stopped WSL distro cold-boots on its first invocation; the
+        // interactive `</dev/tty` attach can race that boot and hang with a
+        // blank terminal. Pre-warm the default distro with a throwaway command
+        // (the equivalent of a manual `wsl -- true`) so the PTY session below
+        // attaches to an already-running distro. Best-effort: a failure here is
+        // surfaced by the real launch instead.
+        #[cfg(windows)]
+        {
+            let is_wsl = std::path::Path::new(&shell)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("wsl"))
+                .unwrap_or(false);
+            if is_wsl {
+                prewarm_wsl(&shell).await;
+            }
+        }
+
+        // Optional invisible OSC 7 injection via per-shell rcfile + custom
+        // args. Falls back silently if the rcfile can't be written.
+        let integration = if shell_integration_enabled {
+            shell_integration::prepare_local(&shell, &session_id)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+
+        let (program, args, mut env) = match integration {
+            Some(ref info) => (info.program.clone(), info.args.clone(), info.env.clone()),
+            None => (shell, Vec::new(), Vec::new()),
+        };
+        env.push(("TERM".into(), "xterm-256color".into()));
+
+        let cmd = if flatpak::spawns_on_host() {
+            flatpak::host_command(&program, &args, &env, cwd.as_deref())
+        } else {
+            let mut c = CommandBuilder::new(&program);
+            c.args(&args);
+            for (k, v) in &env {
+                c.env(k, v);
+            }
+            // A directory that has since been removed would fail the spawn outright;
+            // starting in the default one beats not starting at all.
+            if let Some(dir) = cwd.filter(|d| std::path::Path::new(d).is_dir()) {
+                c.cwd(dir);
+            }
+            c
+        };
+
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| format!("Failed to spawn shell: {e}"))?;
+
+        // Drop slave in parent so EOF propagates when child exits
+        drop(pair.slave);
+
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| format!("Failed to clone PTY reader: {e}"))?;
+
+        let mut writer = pair
+            .master
+            .take_writer()
+            .map_err(|e| format!("Failed to take PTY writer: {e}"))?;
+
+        let master = Arc::new(Mutex::new(Some(pair.master)));
+        let child = Arc::new(Mutex::new(child));
+        #[cfg(windows)]
+        close_console_on_exit(&child, Arc::clone(&master));
+
+        let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(256);
+
+        // The banner and first prompt arrive before the terminal has subscribed.
+        app.terminal_outputs().gate(&session_id);
+        let app_r = app.clone();
+        let id_r = session_id.clone();
+        let child_r = Arc::clone(&child);
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => {
+                        emit_closed(&app_r, &id_r, exited_cleanly(&child_r, EXIT_REAP_WAIT));
+                        break;
+                    }
+                    Ok(n) => emit_output(&app_r, &id_r, &buf[..n]),
+                }
+            }
+        });
+
+        // Writer thread — channel input → PTY
+        std::thread::spawn(move || {
+            while let Ok(data) = input_rx.recv() {
+                if writer.write_all(&data).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let session = LocalSession {
+            input_tx,
+            master,
+            child,
+            tempfiles: integration.map(|i| i.tempfiles).unwrap_or_default(),
+        };
+        self.sessions.lock().await.insert(session_id, session);
+        Ok(())
+    }
+
+    pub async fn send_data(&self, id: &str, data: Vec<u8>) -> Result<(), String> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(id).ok_or("Session not found")?;
+        session
+            .input_tx
+            .try_send(data)
+            .map_err(|e| format!("Send failed: {e}"))
+    }
+
+    pub async fn resize(&self, id: &str, cols: u16, rows: u16) -> Result<(), String> {
+        let master = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions.get(id).ok_or("Session not found")?;
+            Arc::clone(&session.master)
+        };
+        let guard = master.lock().unwrap();
+        let Some(pty) = guard.as_ref() else {
+            return Ok(());
+        };
+        pty.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    pub async fn disconnect(&self, app: &impl SessionApp, id: &str) -> Result<(), String> {
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.remove(id)
+        };
+        app.terminal_outputs().remove(id);
+        if let Some(s) = removed {
+            let _ = s.child.lock().unwrap().kill();
+            shell_integration::cleanup(&s.tempfiles);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    // The master is returned so it outlives the child: dropping it hangs the
+    // pty up and the child dies of SIGHUP before running its script.
+    fn spawn_sh(script: &str) -> (Box<dyn portable_pty::MasterPty + Send>, SharedChild) {
+        let pair = native_pty_system()
+            .openpty(PtySize::default())
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.args(["-c", script]);
+        let child = pair.slave.spawn_command(cmd).expect("spawn sh");
+        (pair.master, Arc::new(Mutex::new(child)))
+    }
+
+    #[test]
+    fn a_zero_exit_is_clean() {
+        let (_master, child) = spawn_sh("exit 0");
+        assert!(exited_cleanly(&child, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_failing_shell_is_not_clean() {
+        let (_master, child) = spawn_sh("exit 3");
+        assert!(!exited_cleanly(&child, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_child_still_running_when_the_wait_ends_is_not_clean() {
+        let (_master, child) = spawn_sh("sleep 5");
+        assert!(!exited_cleanly(&child, Duration::from_millis(100)));
+        let _ = child.lock().unwrap().kill();
+    }
+}

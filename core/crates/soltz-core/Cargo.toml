@@ -1,0 +1,88 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Soltz core: terminal sessions, SFTP, key generation, storage and the vault behind a
+# UniFFI API. Its own workspace: nothing else in the repository is a Cargo package.
+[workspace]
+
+[package]
+name = "soltz-core"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+publish = false
+
+[lib]
+name = "soltz_core"
+# The static library for Swift is built by scripts/build-core.sh
+# (`cargo rustc --crate-type staticlib`): alongside an rlib, rustc skips LTO.
+# The reused upstream modules carry unit tests that need the app's test helpers;
+# this crate's tests are integration tests (tests/), against the public API.
+test = false
+doctest = false
+
+[[bin]]
+name = "uniffi-bindgen-swift"
+path = "uniffi-bindgen-swift.rs"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli", "uniffi/cargo-metadata"]
+
+[dependencies]
+uniffi = { version = "0.32", default-features = false }
+russh = { version = "0.65.0", default-features = false, features = ["flate2", "rsa", "ring", "des"] }
+russh-sftp = "2.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "process", "time", "sync"] }
+tokio-util = { version = "0.7", default-features = false, features = ["io", "io-util", "rt"] }
+tokio-socks = "0.5"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-native-certs = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+# Not the real crate: storage and known-hosts call `dirs` only for a default folder
+# Soltz never uses, and the guard panics instead (see dirs-guard/src/lib.rs).
+dirs = { package = "soltz-dirs-guard", path = "dirs-guard" }
+portable-pty = "0.9"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+sha2 = "0.10"
+base64 = "0.22"
+thiserror = "2"
+libc = "0.2"
+zeroize = "1"
+log = "0.4"
+# Storage and vault.
+chacha20poly1305 = { version = "0.10", features = ["rand_core"] }
+soltz-crypto = { path = "../soltz-crypto" }
+keyring-core = "1"
+# Key generation (commands/keygen.rs).
+rand = "0.8"
+ssh-key = { version = "0.6", features = ["ed25519", "p256", "p384", "p521", "rsa", "encryption"] }
+rsa = { version = "0.9", features = ["getrandom"] }
+# The SFTP layer (sftp/, commands/sftp/).
+async-trait = "0.1"
+infer = "0.19"
+# Tar streaming (commands/sftp/local_tar.rs), compiled in with the host probe the
+# copy engine hashes through; Soltz does not offer tar transfers.
+tar = "0.4"
+flate2 = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+
+[dev-dependencies]
+# Renders the local shell's output, so the test sees screen rows, not escape codes.
+vt100 = "0.16"
+tempfile = "3"
+
+# The vault test derives a master-password key at the real Argon2id cost (128 MiB, t=3).
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+
+[profile.release]
+# Matches the upstream workspace profile, minus `strip`: the bindgen reads UniFFI
+# metadata symbols out of the static library.
+codegen-units = 1
+lto = true

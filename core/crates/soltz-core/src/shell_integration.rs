@@ -1,0 +1,2292 @@
+// Per-shell setup for invisible OSC 7 emission. Used by both local PTY spawn
+// (via temp rcfile + custom shell args) and remote SSH (via an exec wrapper
+// script that detects the user's shell at runtime).
+//
+// The strategy mirrors iTerm/ghostty/kitty shell integration: rather than
+// echoing setup commands into a running shell (visible), we control the
+// shell's *spawn* so it starts already-hooked.
+
+use std::path::{Path, PathBuf};
+
+/// Files/dirs to clean up when the session ends.
+pub struct LocalIntegration {
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub tempfiles: Vec<PathBuf>,
+}
+
+/// Inspect a shell path and prepare a local PTY spawn that injects OSC 7
+/// emission on every prompt. Returns `Ok(None)` for shells that need no
+/// injection (fish already emits OSC 7) or can't be hooked (cmd, wsl).
+// Spawns a local desktop shell; Android has no local shell to hook.
+#[allow(clippy::disallowed_methods)]
+pub fn prepare_local(shell: &str, session_id: &str) -> std::io::Result<Option<LocalIntegration>> {
+    let shell_name = Path::new(shell)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let temp_dir =
+        crate::local::flatpak::host_visible_temp_dir().unwrap_or_else(std::env::temp_dir);
+
+    match shell_name.as_str() {
+        "bash" | "sh" => {
+            let rc_path = temp_dir.join(format!("soltz-bashrc-{session_id}"));
+            std::fs::write(&rc_path, BASH_RC)?;
+            Ok(Some(LocalIntegration {
+                program: shell.to_string(),
+                // GNU bash requires long options before short options;
+                // `bash -i --rcfile FILE` errors with "--: invalid option".
+                args: vec![
+                    "--rcfile".into(),
+                    rc_path.to_string_lossy().into_owned(),
+                    "-i".into(),
+                ],
+                env: vec![],
+                tempfiles: vec![rc_path],
+            }))
+        }
+        "zsh" => {
+            let zdotdir = temp_dir.join(format!("soltz-zdotdir-{session_id}"));
+            std::fs::create_dir_all(&zdotdir)?;
+            std::fs::write(zdotdir.join(".zshenv"), ZSH_ZSHENV)?;
+            let orig = std::env::var("ZDOTDIR")
+                .or_else(|_| std::env::var("HOME"))
+                .unwrap_or_default();
+            Ok(Some(LocalIntegration {
+                program: shell.to_string(),
+                args: vec!["-l".into(), "-i".into()],
+                env: vec![
+                    ("ZDOTDIR".into(), zdotdir.to_string_lossy().into_owned()),
+                    ("ZDOTDIR_ORIG".into(), orig),
+                ],
+                tempfiles: vec![zdotdir],
+            }))
+        }
+        "pwsh" | "powershell" => {
+            let script_path = temp_dir.join(format!("soltz-pwsh-{session_id}.ps1"));
+            std::fs::write(&script_path, PWSH_SCRIPT)?;
+            Ok(Some(LocalIntegration {
+                program: shell.to_string(),
+                args: vec![
+                    "-NoExit".into(),
+                    "-File".into(),
+                    script_path.to_string_lossy().into_owned(),
+                ],
+                env: vec![],
+                tempfiles: vec![script_path],
+            }))
+        }
+        "cmd" => {
+            // cmd's PROMPT command supports $E (escape) and $P (cwd with
+            // backslashes). We emit OSC 7 via the prompt directly — no
+            // function hook needed. $E\ is ESC + backslash = ST terminator.
+            let bat_path = temp_dir.join(format!("soltz-cmd-{session_id}.bat"));
+            std::fs::write(&bat_path, CMD_BAT)?;
+            Ok(Some(LocalIntegration {
+                program: shell.to_string(),
+                args: vec!["/k".into(), bat_path.to_string_lossy().into_owned()],
+                env: vec![],
+                tempfiles: vec![bat_path],
+            }))
+        }
+        "wsl" => {
+            // wsl.exe spawns the user's default WSL distro. The WSL wrapper
+            // differs from the SSH one only in its printf format: paths are
+            // emitted with host=wsl.localhost and the distro as the first
+            // path segment so the frontend can build a UNC path that
+            // Windows' fs API can read (`\\wsl.localhost\<distro>\path`).
+            // The rcfile lives inside the WSL filesystem; no Windows-side
+            // temp files.
+            Ok(Some(LocalIntegration {
+                program: shell.to_string(),
+                args: vec!["--".into(), "sh".into(), "-c".into(), wsl_exec_command()],
+                env: vec![],
+                tempfiles: vec![],
+            }))
+        }
+        // fish already emits OSC 7 on every prompt. Unknown shells fall
+        // through with no integration.
+        _ => Ok(None),
+    }
+}
+
+/// Best-effort cleanup. Files may already be gone if user wiped /tmp.
+pub fn cleanup(tempfiles: &[PathBuf]) {
+    for p in tempfiles {
+        if p.is_dir() {
+            let _ = std::fs::remove_dir_all(p);
+        } else {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+// D (last exit status) and A (prompt start) ride on the OSC 7 printf, so each
+// prompt is still one write and nothing touches PS1.
+macro_rules! pwd_fn {
+    ($lead_fmt:literal, $lead_args:literal, $url:literal, $host:literal) => {
+        concat!(
+            r##"__soltz_pwd() { printf '"##,
+            $lead_fmt,
+            r##"\e]133;D;%s\a\e]133;A\a\e]7;"##,
+            $url,
+            r##"\a' "##,
+            $lead_args,
+            r##""$?" ""##,
+            $host,
+            r##"" "$PWD"; }
+"##
+        )
+    };
+}
+
+// PS0 is bash's only pre-exec point that needs no DEBUG trap; bash < 4.4
+// ignores it, so those hosts send no C.
+macro_rules! bash_hooks {
+    ($url:literal, $host:literal) => {
+        concat!(
+            // zsh's PROMPT_SP: readline assumes column 0. Skipped until bash knows COLUMNS,
+            // which checkwinsize keeps fresh.
+            pwd_fn!(
+                r##"%b%*s%b"##,
+                r##""${COLUMNS:+\e[7m%\e[m}" "$((${COLUMNS:-1}-1))" '' "${COLUMNS:+\r\e[K}" "##,
+                $url,
+                $host
+            ),
+            r##"case ";${PROMPT_COMMAND-};" in
+  *";__soltz_pwd;"*) ;;
+  *) PROMPT_COMMAND="__soltz_pwd${PROMPT_COMMAND:+;${PROMPT_COMMAND}}" ;;
+esac
+shopt -s checkwinsize
+PS0='\e]133;C\a'"${PS0-}"
+__soltz_pwd 2>/dev/null
+"##
+        )
+    };
+}
+
+// --rcfile skips bash's own startup files, so replay the login chain: PS1 and
+// profile-driven welcome text live there.
+macro_rules! bash_login_chain {
+    () => {
+        r##"if [ -r /etc/profile ]; then . /etc/profile; fi
+if [ -r "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile"
+elif [ -r "$HOME/.bash_login" ]; then . "$HOME/.bash_login"
+elif [ -r "$HOME/.profile" ]; then . "$HOME/.profile"
+else
+  [ -r /etc/bash.bashrc ] && . /etc/bash.bashrc
+  [ -r "$HOME/.bashrc" ] && . "$HOME/.bashrc"
+fi
+"##
+    };
+}
+
+macro_rules! zsh_hooks {
+    ($url:literal, $host:literal) => {
+        concat!(
+            pwd_fn!("", "", $url, $host),
+            r##"__soltz_run() { printf '\e]133;C\a'; }
+typeset -ag precmd_functions preexec_functions
+(($precmd_functions[(I)__soltz_pwd])) || precmd_functions+=(__soltz_pwd)
+(($preexec_functions[(I)__soltz_run])) || preexec_functions+=(__soltz_run)
+__soltz_pwd 2>/dev/null
+"##
+        )
+    };
+}
+
+// .zshenv trampoline (kitty/ghostty technique): restores ZDOTDIR from
+// ZDOTDIR_ORIG then sources the real .zshenv so zsh continues startup with
+// the user's files. Fixes configs like zsh4humans that define functions in
+// ~/.zshenv before .zshrc runs. The hooks install at .zshenv time, so rc
+// files that overwrite precmd_functions or preexec_functions (instead of
+// appending) drop them — accepted trade-off shared with kitty/ghostty.
+macro_rules! zsh_env {
+    ($url:literal, $host:literal) => {
+        concat!(
+            r##"# soltz
+if [ -n "${ZDOTDIR_ORIG-}" ]; then ZDOTDIR="$ZDOTDIR_ORIG"; else unset ZDOTDIR; fi
+unset ZDOTDIR_ORIG
+[ -f "${ZDOTDIR:-$HOME}/.zshenv" ] && source "${ZDOTDIR:-$HOME}/.zshenv"
+"##,
+            zsh_hooks!($url, $host)
+        )
+    };
+}
+
+// POSIX sh has no pre-exec or pre-prompt hook, so it reports the cwd only.
+macro_rules! sh_hooks {
+    () => {
+        r##"__soltz_pwd() { printf '\033]7;file://%s%s\007' "${HOSTNAME:-}" "$PWD"; }
+PS1='$(__soltz_pwd)'"${PS1:-$ }"
+"##
+    };
+}
+
+const BASH_RC: &str = concat!(bash_login_chain!(), bash_hooks!("file://%s%s", "$HOSTNAME"));
+
+const ZSH_ZSHENV: &str = zsh_env!("file://%s%s", "${HOST}");
+
+// $E = ESC, $P = path with backslashes, $G = >, $S = space. The $E\\ sequence
+// is ESC + backslash = ST (string terminator), closing the OSC 7. The path
+// uses backslashes; the frontend OSC handler normalizes to forward slashes.
+const CMD_BAT: &str = "@echo off\r\nprompt $E]7;file://localhost/$P$E\\$P$G$S\r\n";
+
+// PSReadLine defines PSConsoleHostReadLine only once it has loaded, so the C
+// wrapper is installed from the first prompt. Every variable is set or tested
+// before it is read: a profile may turn strict mode on.
+const PWSH_SCRIPT: &str = r##"if (Test-Path $PROFILE) { . $PROFILE }
+$global:__soltzOldPrompt = if (Test-Path Function:\prompt) { $function:prompt } else { $null }
+$global:__soltzReadLine = $null
+function global:prompt {
+  $code = if ($global:?) { 0 } elseif ((Test-Path Variable:\LASTEXITCODE) -and $global:LASTEXITCODE) { $global:LASTEXITCODE } else { 1 }
+  if (-not $global:__soltzReadLine -and (Test-Path Function:\PSConsoleHostReadLine)) {
+    $global:__soltzReadLine = $function:PSConsoleHostReadLine
+    function global:PSConsoleHostReadLine {
+      $line = & $global:__soltzReadLine
+      if ("$line".Trim()) { [Console]::Write([char]27 + ']133;C' + [char]7) }
+      $line
+    }
+  }
+  $cwd = (Get-Location).Path -replace '\\', '/'
+  $hostName = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { 'localhost' }
+  [Console]::Write([char]27 + ']133;D;' + $code + [char]7 + [char]27 + ']133;A' + [char]7 + [char]27 + ']7;file://' + $hostName + '/' + $cwd + [char]7)
+  if ($global:__soltzOldPrompt) { & $global:__soltzOldPrompt } else { "PS $cwd> " }
+}
+"##;
+
+/// POSIX wrapper that detects $SHELL at runtime, writes a per-session rcfile
+/// under /tmp, and execs into a hooked interactive shell. NOT invoked
+/// directly — `ssh_exec_command` wraps it in a printf bootstrap so it's
+/// safe to send regardless of the remote login shell's syntax (fish/csh
+/// would otherwise choke on POSIX case/heredoc).
+///
+/// The `<&2` on every exec is load-bearing: when run via
+/// `printf '…' | sh`, the inner sh's stdin is the pipe from printf. After
+/// exec, the new shell would inherit that already-closed pipe and
+/// immediately exit on EOF (printing "exit" and looping reconnect).
+/// Duplicating stderr — which still holds the pty file description sshd
+/// created — restores the real PTY.
+///
+/// Do NOT reopen by path (`</dev/tty`): that creates a *different* file
+/// description of the tty, and sudo's `use_pty` mode (default on modern
+/// Ubuntu/Debian) then fails to recognize the shell's stdin as the user's
+/// terminal. Input handling splits between sudo's pty relay and the command,
+/// and most keystrokes are silently lost inside `sudo -i` (a key had to be
+/// pressed several times for one to register). Same reasoning as the
+/// persistent wrapper's `<&2` (see `persistent_exec_command`).
+///
+/// The temp file leaks intentionally — /tmp is cleared on reboot, and trying
+/// to rm it from inside the rcfile races with bash/zsh reading it.
+///
+/// No bash (busybox/dash-only host): hook a POSIX sh through an `$ENV` file.
+/// Without that branch `exec bash` fails with 127 and the session loops
+/// disconnect/reconnect. A login sh reads `$ENV` only after /etc/profile, which
+/// may repoint it (OpenWrt: /etc/shinit), so the file replays that chain.
+///
+/// Comments stay out of the script itself: every byte counts against
+/// `MAX_EXEC_COMMAND_LEN`.
+const SSH_WRAPPER: &str = concat!(
+    r##"case "$(basename "${SHELL:-/bin/sh}")" in
+zsh)
+  ZDOTDIR_TMP=$(mktemp -d 2>/dev/null) || exec zsh -l -i <&2
+  export ZDOTDIR_ORIG="${ZDOTDIR:-$HOME}"
+  cat > "$ZDOTDIR_TMP/.zshenv" <<'EOF'
+"##,
+    zsh_env!("file://%s%s", "${HOST}"),
+    r##"EOF
+  ZDOTDIR="$ZDOTDIR_TMP" exec zsh -l -i <&2
+  ;;
+fish)
+  exec fish -l -i <&2
+  ;;
+*)
+  if command -v bash >/dev/null 2>&1; then
+  RCFILE_TMP=$(mktemp 2>/dev/null) || exec bash -l -i <&2
+  cat > "$RCFILE_TMP" <<'EOF'
+"##,
+    bash_login_chain!(),
+    bash_hooks!("file://%s%s", "$HOSTNAME"),
+    r##"EOF
+  exec bash --rcfile "$RCFILE_TMP" -i <&2
+  else
+  ENVF=$(mktemp 2>/dev/null) || exec sh -l -i <&2
+  cat > "$ENVF" <<'EOF'
+__soltz_env=$ENV
+[ -r /etc/profile ] && . /etc/profile
+[ -r "$HOME/.profile" ] && . "$HOME/.profile"
+[ "${ENV-}" != "$__soltz_env" ] && [ -r "${ENV-}" ] && . "$ENV"
+unset __soltz_env
+"##,
+    sh_hooks!(),
+    r##"EOF
+  ENV="$ENVF" exec sh -i <&2
+  fi
+  ;;
+esac
+"##
+);
+
+/// sshd emits the MOTD only for an interactive `shell` request, not the `exec`
+/// path integration/persistence use, so reproduce it. Single quote-free line so
+/// it can embed in the persist inner; respects ~/.hushlogin.
+pub const MOTD_PREAMBLE: &str = "[ ! -e $HOME/.hushlogin ] && { [ -r /run/motd.dynamic ] && cat /run/motd.dynamic; [ -r /etc/motd ] && cat /etc/motd; }";
+
+/// Build the SSH exec payload. The remote login shell (whatever it may be:
+/// bash, zsh, fish, csh, dash) only needs to parse `printf '...' | sh` — a
+/// syntax common to every Unix shell. The decoded POSIX wrapper then
+/// runs under /bin/sh and execs into the user's actual shell with OSC 7
+/// emission hooked.
+///
+/// `prefix` (a `cd` into the session's starting directory, or empty) runs
+/// inside the decoded wrapper. Prefixing the outer payload instead would put it
+/// in front of the login shell, which may be csh or fish; inside, it is /bin/sh.
+pub fn ssh_exec_command(prefix: &str) -> String {
+    encode_wrapper(&format!("{prefix}\n{MOTD_PREAMBLE}\n{SSH_WRAPPER}"))
+}
+
+/// Longest `exec` payload we will put on the wire. dropbear's `MAX_STRING_LEN`
+/// is `MAX(MAX_CMD_LEN, 2400)` = 9000, and passing it is not a rejected request
+/// but `dropbear_exit("String too long")` — the connection dies right after
+/// auth succeeds (#85). Kept under that with room for the session key.
+pub const MAX_EXEC_COMMAND_LEN: usize = 8192;
+
+const TMUX_SOCKET: &str = "soltz";
+
+const TMUX_CC_VERSIONS: &str = r#"*"tmux "3.[2-9]*|*"tmux "[4-9]*|*"tmux "[1-9][0-9]*"#;
+
+pub const CONTROL_MODE_MARKER: &str = "SOLTZ_CC";
+
+const RAW_SENTINEL: &str = r"printf '\033P1000r\033\\'";
+
+fn tmux_version_case(arms: &str) -> String {
+    format!(r#"case "$(tmux -V 2>/dev/null)" in {arms} esac"#)
+}
+
+fn tmux_cc_arm(action: &str) -> String {
+    format!("{TMUX_CC_VERSIONS}) {action} ;;")
+}
+
+fn tmux_cc_case(action: &str) -> String {
+    tmux_version_case(&tmux_cc_arm(action))
+}
+
+fn tmux_gate(arms: &str) -> String {
+    format!(
+        "command -v tmux >/dev/null 2>&1 || exit 0\n{}\n",
+        tmux_version_case(arms)
+    )
+}
+
+fn mode_style(colors: &crate::ssh::control_mode::TerminalColors) -> String {
+    format!("fg={},bg={}", colors.selection_fg, colors.selection_bg)
+}
+
+/// Prepended to the pane command so the session shell no longer looks like it
+/// is inside a multiplexer (#159). The persistence wrapper is an implementation
+/// detail, but tmux exports `$TMUX` into the shell it starts, and a tmux client
+/// with no `-L`/`-S` takes its socket from `$TMUX` — so a user's own `tmux ls`
+/// listed Soltz's private socket instead of their sessions, and `tmux attach`
+/// refused outright ("sessions should be nested with care, unset $TMUX to
+/// force"). Nothing in Soltz reads these back: every control path names the
+/// socket and session explicitly.
+const TMUX_ENV_STRIP: &str = "unset TMUX TMUX_PANE; ";
+
+/// screen's equivalent of [`TMUX_ENV_STRIP`]. `screen -x` inside a session
+/// would otherwise join the wrapper rather than the user's own session.
+const SCREEN_ENV_STRIP: &str = "unset STY WINDOW; ";
+
+/// Shown once, inside the new window, when a session lands on a GNU screen
+/// older than 5.0. Those parse `ESC[38;2;r;g;b` and emit nothing, so TrueColor
+/// TUIs (btop) draw solid blocks instead of shaded braille (#118) — there is no
+/// termcap/terminfo setting that recovers it. screen 5.0 added a `truecolor`
+/// command (off by default) which does pass RGB through; the rc below enables
+/// it, so 5.x reaches this notice only when mktemp gave us no rc to write.
+const SCREEN_DEGRADED_NOTICE: &str = "[soltz] tmux not found - using GNU screen without TrueColor. TUIs like btop may render as solid blocks. Install tmux or GNU screen 5.0+, or turn off persistent sessions for this host to connect without a multiplexer.";
+
+/// Notice printed on the raw pty: CR before each LF because the terminal is
+/// still in raw mode at this point, so a bare LF would stair-step.
+fn notice_printf(message: &str) -> String {
+    format!("printf '\\r\\n{message}\\r\\n'")
+}
+
+/// tmux/screen session name for a session id, sanitized to `[A-Za-z0-9_-]`.
+/// Stable across reconnect so the multiplexer re-attaches the live session.
+pub fn tmux_session_key(session_id: &str) -> String {
+    let sanitized: String = session_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("soltz_{sanitized}")
+}
+
+/// Wrap `inner` (the existing exec bootstrap) in tmux, else screen, else a
+/// plain shell. `inner` must contain no double quotes: it is embedded in the
+/// double-quoted multiplexer command. The outer sh's stdin is the printf
+/// pipe, so the pty is re-attached with `<&2`: stderr still holds the
+/// original pty file description sshd created. Re-opening the device by path
+/// (`</dev/tty` or the pts path) breaks modern tmux — 3.4+ rejects
+/// `/dev/tty` outright ("can't use /dev/tty"), and a fresh open of the pts
+/// makes the server's redraw writes vanish, leaving a connected-but-blank
+/// terminal. Duplicating the inherited description avoids both.
+///
+/// The screen branch first self-heals: `screen -wipe` clears `Dead ???`
+/// entries left by abrupt drops, and any same-named duplicates are collapsed to
+/// one server. Unlike tmux's server-serialized `new-session -A`, `screen -D -R`
+/// has no name-collision protection — concurrent connects can create duplicates,
+/// and once two exist `-D -R` refuses to attach ("several suitable screens"),
+/// which closes the channel and feeds the reconnect loop into spawning more.
+///
+/// It then version-gates `truecolor on`, which only screen 5.0+ understands:
+/// older screens print `unknown command 'truecolor'` and get
+/// `SCREEN_DEGRADED_NOTICE` instead. `persistent_attach_command` needs no such
+/// gate — `screen -x` joins the running server, which keeps the setting this rc
+/// gave it at create time.
+///
+/// Create path only: session keys derive from fresh UUIDs, so `-A`/`-D -R`
+/// never meet a session another device is attached to. Re-attach and
+/// cross-device join go through `persistent_attach_command`.
+///
+/// The screen branch gives up its escape key the same way the tmux branch gives
+/// up its prefix, so a user's own screen inside ours keeps `C-a` (#159 follow-up:
+/// a bare `C-a d` used to detach *our* wrapper, which the app then silently
+/// reconnected). screen has no `prefix None` equivalent — `escape` always names
+/// some key — so it is pointed at `\377`, a byte no key produces in a UTF-8
+/// terminal. The one theoretical cost is a latin-1 session where 0xFF is `ÿ`;
+/// that is worth trading for a wrapper the user's own screen can nest inside.
+/// Unlike the tmux prefix this needs no version gate: `escape` and octal escapes
+/// long predate any screen still in use, and a screen that did reject the line
+/// would simply keep its default key.
+///
+/// Both multiplexer configs override the outer terminal's `cnorm` (cursor
+/// normal) capability to plain `\E[?25h`. xterm-256color's stock cnorm is
+/// `\E[?12l\E[?25h`, and the `?12l` half is "stop cursor blinking" — xterm.js
+/// maps DECRST 12 straight onto `options.cursorBlink = false`, so every
+/// multiplexer redraw silently turned off the user's cursor-blink setting in
+/// SSH sessions (local sessions, with no multiplexer, kept blinking). Remote
+/// apps that explicitly request a blinking cursor (cvvis / DECSCUSR) still
+/// work; only the implicit blink-off on redraw is dropped.
+///
+/// The wrapper is meant to be invisible to whatever the user runs inside it, so
+/// it also gives up the prefix key: `prefix None` leaves `C-b` to the user's own
+/// tmux instead of being swallowed by ours (#159). Nothing here needs a prefix —
+/// the status line is off and every Soltz command addresses the session by
+/// name over the `-L soltz` socket. It is set two ways because a config file
+/// is only read when the server starts: `-f` covers a cold server, and the
+/// `set -g` push covers one an earlier session already left running. Both are
+/// version-gated to tmux 2.1+, the first release that accepts `None` as a key.
+///
+/// `inner` is bound once to `$V` rather than inlined at each of the five call
+/// sites. Inlining made the exec payload ~21.7 KB, over dropbear's 9000-byte
+/// `MAX_STRING_LEN`, so dropbear killed the channel with "String too long" the
+/// instant authentication succeeded (#85). `V="…"` is double-quoted, so `inner`
+/// still expands in this outer shell exactly as when it was inlined.
+pub fn persistent_exec_command(session_key: &str, inner: &str) -> String {
+    let script = format!(
+        r#"V="{inner}"
+if command -v tmux >/dev/null 2>&1; then
+  V="{tmux_strip}$V"
+  TMUX_PREFIX_NONE=
+  case "$(tmux -V 2>/dev/null)" in
+    *"tmux "[3-9]*|*"tmux "[1-9][0-9]*|*"tmux "2.[1-9]*)
+      tmux -L {socket} set -g prefix None >/dev/null 2>&1
+      TMUX_PREFIX_NONE=1 ;;
+  esac
+  CC=
+  SZ=
+  case "$(tmux -V 2>/dev/null)" in
+    {cc})
+      CC=-CC
+      S=$(stty size <&2 2>/dev/null)
+      [ -n "$S" ] && SZ="-x ${{S#* }} -y ${{S% *}}" ;;
+  esac
+  [ -n "$CC" ] || {raw}
+  TMUX_CONF=$(mktemp 2>/dev/null)
+  if [ -n "$TMUX_CONF" ]; then
+    cat > "$TMUX_CONF" <<'EOF'
+# soltz
+set -g status off
+set -g mouse on
+set -g default-terminal "xterm-256color"
+set -g history-limit 50000
+set -sg escape-time 0
+set -g destroy-unattached off
+set -ga terminal-overrides ',*:cnorm=\E[?25h:Tc'
+EOF
+    [ -n "$TMUX_PREFIX_NONE" ] && echo "set -g prefix None" >> "$TMUX_CONF"
+    exec tmux -L {socket} -f "$TMUX_CONF" $CC new-session -A -s {key} $SZ "$V" <&2
+  fi
+  exec tmux -L {socket} $CC new-session -A -s {key} $SZ "$V" <&2
+elif command -v screen >/dev/null 2>&1; then
+  {raw}
+  V="{screen_strip}$V"
+  screen -wipe >/dev/null 2>&1
+  for d in $(screen -ls 2>/dev/null | grep -F .{key} | awk '{{print $1}}' | tail -n +2); do
+    screen -S "$d" -X quit >/dev/null 2>&1
+  done
+  SCREEN_RC=$(mktemp 2>/dev/null)
+  if [ -n "$SCREEN_RC" ]; then
+    cat > "$SCREEN_RC" <<'EOF'
+# soltz
+startup_message off
+msgwait 0
+msgminwait 0
+vbell off
+defscrollback 50000
+escape \377\377
+termcapinfo xterm* ti@:te@:ve=\E[?25h
+EOF
+    case "$(screen --version 2>/dev/null)" in
+      *"Screen version "[5-9]*|*"Screen version "[1-9][0-9]*)
+        echo truecolor on >> "$SCREEN_RC" ;;
+      *) V="{screen_notice}; $V" ;;
+    esac
+    exec screen -c "$SCREEN_RC" -S {key} -D -R sh -c "$V" <&2
+  fi
+  V="{screen_notice}; $V"
+  exec screen -S {key} -D -R sh -c "$V" <&2
+else
+  {raw}
+  {no_mux_notice}
+  exec sh -c "$V" <&2
+fi
+"#,
+        socket = TMUX_SOCKET,
+        key = session_key,
+        inner = inner,
+        tmux_strip = TMUX_ENV_STRIP,
+        cc = TMUX_CC_VERSIONS,
+        raw = RAW_SENTINEL,
+        screen_strip = SCREEN_ENV_STRIP,
+        screen_notice = notice_printf(SCREEN_DEGRADED_NOTICE),
+        no_mux_notice =
+            notice_printf("[soltz] tmux/screen not found - session will not survive disconnects"),
+    );
+    encode_wrapper(&script)
+}
+
+/// Attach-only wrapper: co-attaches a live session (tmux plain attach, screen
+/// `-x` multi-display) and NEVER creates one — `persistent_probe_command` runs
+/// first, so reaching the fallthrough means the session died in between; the
+/// exit just closes the channel and the caller re-probes.
+pub fn persistent_attach_command(session_key: &str) -> String {
+    let script = format!(
+        r#"if command -v tmux >/dev/null 2>&1 && tmux -L {socket} has-session -t {key} 2>/dev/null; then
+  CC=
+  {cc}
+  [ -n "$CC" ] || {raw}
+  exec tmux -L {socket} $CC attach-session -t {key} <&2
+elif command -v screen >/dev/null 2>&1; then
+  {raw}
+  exec screen -x -S {key} <&2
+fi
+{raw}
+printf '\r\n[soltz] session has ended\r\n'
+exit 97
+"#,
+        socket = TMUX_SOCKET,
+        key = session_key,
+        cc = tmux_cc_case("CC=-CC"),
+        raw = RAW_SENTINEL,
+    );
+    encode_wrapper(&script)
+}
+
+/// One-shot existence probe mirroring the wrapper's tmux-first order. Prints
+/// SOLTZ_PRESENT when the session is alive, SOLTZ_NOMUX when the host has
+/// neither multiplexer; `screen -wipe` first so a dead entry doesn't read as present.
+pub fn persistent_probe_command(session_key: &str) -> String {
+    let script = format!(
+        r#"if command -v tmux >/dev/null 2>&1 && tmux -L {socket} has-session -t {key} 2>/dev/null; then
+  printf SOLTZ_PRESENT
+elif command -v screen >/dev/null 2>&1; then
+  screen -wipe >/dev/null 2>&1
+  screen -ls 2>/dev/null | grep -qF .{key} && printf SOLTZ_PRESENT
+elif ! command -v tmux >/dev/null 2>&1; then
+  printf SOLTZ_NOMUX
+fi
+true"#,
+        socket = TMUX_SOCKET,
+        key = session_key,
+    );
+    encode_wrapper(&script)
+}
+
+/// Legacy tmux (< 3.2) only: Enter leaves wheel-entered copy-mode, a drag keeps
+/// its highlight (3.0+), and the selection takes the theme colours.
+pub fn persistent_legacy_setup_command(
+    session_key: &str,
+    colors: Option<&crate::ssh::control_mode::TerminalColors>,
+) -> String {
+    let style = colors
+        .map(|c| {
+            format!(
+                "printf '%s\\n' \"set -g mode-style '{}'\" >> \"$F\"\n",
+                mode_style(c)
+            )
+        })
+        .unwrap_or_default();
+    let script = format!(
+        r#"NC=
+{gate}{wait}F=$(mktemp 2>/dev/null) || exit 0
+for t in copy-mode copy-mode-vi; do
+  printf 'bind -T %s Enter send -X cancel \; send-keys Enter\n' $t
+  [ -n "$NC" ] && printf 'bind -T %s MouseDragEnd1Pane send -X copy-selection-no-clear\n' $t
+done > "$F"
+{style}tmux -L {socket} source-file "$F"
+rm -f "$F"
+"#,
+        socket = TMUX_SOCKET,
+        gate = tmux_gate(r#"*"tmux "3.[01]*) NC=1 ;; *"tmux "2.[6-9]*) ;; *) exit 0 ;;"#),
+        wait = tmux_wait_session(session_key),
+    );
+    encode_wrapper(&script)
+}
+
+fn tmux_wait_session(session_key: &str) -> String {
+    format!(
+        r#"i=0
+until tmux -L {TMUX_SOCKET} has-session -t ={session_key} 2>/dev/null; do
+  [ $i -ge 15 ] && exit 0
+  sleep 1
+  i=$((i+1))
+done
+"#
+    )
+}
+
+/// tmux < 3.2 fires `client-detached` only for `detach-client`, never for a lost client.
+const TTL_TMUX_VERSIONS: &str = TMUX_CC_VERSIONS;
+
+/// `soltz_idle PID...`: every process under the pane pids is allowlisted and not running
+/// (prints the shell pids). `soltz_quiet PID...`: those shells' summed utime+stime.
+macro_rules! ttl_idle_check {
+    () => {
+        r#"unset COLUMNS
+soltz_idle() {
+  o=$(ps -e -o pid= -o ppid= -o stat= -o comm= -o args=) && [ -n "$o" ] || return 1
+  printf '%s\n' "$o" | awk -v r="$*" '
+function sh(c) { return c ~ /^(sh|bash|zsh|fish|dash|ksh|mksh|ash|tcsh|csh|busybox)$/ }
+function kind(l,  a, n, i) {
+  n = split(l, a, " ")
+  for (i = 6; i <= n; i++) {
+    if (a[i] ~ /^--(rcfile|init-file)$/) i++
+    else if (a[i] ~ /^-[^-]*c/ || a[i] ~ /^--command/) return "c"
+    else if (a[i] ~ /^-[^-]*s/ || a[i] !~ /^[-+]/) return "x"
+  }
+  return "i"
+}
+$1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ || NF < 5 { bad = 1 }
+{ c = $4; sub(/^-/, "", c); C[$1] = c; S[$1] = $3; L[$1] = $0; K[$2] = K[$2] " " $1 }
+END {
+  if (bad || !(1 in C)) exit 1
+  t = split(r, Q, " ")
+  if (!t) exit 1
+  for (h = 1; h <= t; h++) W[h] = 1
+  for (h = 1; h <= t; h++) {
+    x = Q[h]
+    if (!(x in C) || S[x] ~ /^R/) exit 1
+    if (x in V) continue
+    V[x] = 1; c = C[x]; w = 0
+    if (sh(c)) {
+      k = kind(L[x])
+      if (k == "x" || (k == "c" && !W[h])) exit 1
+      w = k == "c"
+      print x
+    } else if (c !~ /^(login|sudo|su|doas)$/ && c !~ /^gitstatusd/) exit 1
+    m = split(K[x], z, " ")
+    for (j = 1; j <= m; j++) { Q[++t] = z[j]; W[t] = w }
+  }
+}'
+}
+soltz_quiet() {
+  l=$(soltz_idle "$@") || return 1
+  n=0
+  for p in $l; do
+    f=$(cat "${SOLTZ_PROC:-/proc}/$p/stat" 2>/dev/null) || return 1
+    set -- ${f##*)}
+    case "${12}:${13}" in *[!0-9:]*|:*|*:) return 1 ;; esac
+    n=$((n + ${12} + ${13}))
+  done
+  echo $n
+}
+"#
+    };
+}
+
+#[cfg(test)]
+const TTL_IDLE_CHECK: &str = ttl_idle_check!();
+
+/// `$1` is the session; the hook decodes it from [`TTL_REAPER_OPTION`] (see [`ttl_reaper_option`]).
+/// Every failed check exits 0 without killing.
+pub(crate) const TTL_REAPER: &str = concat!(
+    ttl_idle_check!(),
+    r#"S=$1
+T="tmux -L soltz"
+case $S in soltz_*) ;; *) exit 0 ;; esac
+L=$($T show -v -t "=$S:" @soltz_ttl 2>/dev/null)
+case $L in ''|0?*|*[!0-9]*|??????????*) exit 0 ;; esac
+soltz_held() {
+  $T has-session -t "=$S" 2>/dev/null &&
+  [ "$($T display -p -t "=$S:" '#{session_attached}' 2>/dev/null)" = 0 ] &&
+  [ "$($T show -v -t "=$S:" @soltz_ttl 2>/dev/null)" = "$L" ] &&
+  { [ -z "$D" ] || [ "$($T show -v -t "=$S:" @soltz_detached_at 2>/dev/null)" = "$D" ]; }
+}
+soltz_now() {
+  N=$(date +%s 2>/dev/null)
+  case $N in ''|*[!0-9]*|????????????*) exit 0 ;; esac
+}
+D=
+soltz_held || exit 0
+soltz_now
+D="$N.$$"
+E=$((N + L))
+$T set -t "=$S:" @soltz_detached_at "$D" 2>/dev/null || exit 0
+while soltz_now; [ "$N" -lt "$E" ]; do
+  w=$((E - N))
+  [ "$w" -le 300 ] || w=300
+  sleep "$w" || exit 0
+  soltz_held || exit 0
+done
+soltz_held || exit 0
+P=$($T list-panes -s -t "=$S:" -F '#{pane_pid}' 2>/dev/null) && [ -n "$P" ] || exit 0
+c=
+for i in 1 2 3; do
+  [ $i = 1 ] || sleep 5 || exit 0
+  n=$(soltz_quiet $P) || exit 0
+  [ -z "$c" ] || [ "$n" = "$c" ] || exit 0
+  c=$n
+done
+soltz_held || exit 0
+$T kill-session -t "=$S" 2>/dev/null
+exit 0
+"#
+);
+
+/// Versioned: hooks already armed by older clients keep calling the name they were given.
+pub(crate) const TTL_REAPER_OPTION: &str = "@soltz_reap1";
+
+/// tmux 3.4 stores `$` as `\$` and `show` turns newlines into `_` outside tmux, so the
+/// option holds the reaper as a printf format of printable ASCII only.
+fn ttl_reaper_option() -> String {
+    printf_escape(TTL_REAPER)
+}
+
+/// The reaper rejects 10+ digit TTLs; `$((now + ttl))` must not overflow.
+const MAX_TTL_SECS: u64 = 999_999_999;
+
+pub fn persistent_ttl_command(session_key: &str, ttl_secs: Option<u64>) -> String {
+    let action = match ttl_secs {
+        Some(secs) => format!(
+            r#"$T set -g {TTL_REAPER_OPTION} {reaper} &&
+$T set -t ={key}: @soltz_ttl {secs} &&
+$T set-hook -t ={key}: client-detached 'run-shell -b "sh -c \"\$(printf \"\$(tmux -L {socket} show -gv {TTL_REAPER_OPTION})\")\" soltz-reap #{{session_name}} >/dev/null 2>&1 || :"'
+"#,
+            reaper = crate::ssh::exec::shell_quote(&ttl_reaper_option()),
+            secs = secs.min(MAX_TTL_SECS),
+            key = session_key,
+            socket = TMUX_SOCKET,
+        ),
+        None => format!(
+            r#"$T set-hook -u -t ={session_key}: client-detached 2>/dev/null
+$T set -u -t ={session_key}: @soltz_ttl 2>/dev/null
+true
+"#
+        ),
+    };
+    let script = format!(
+        r#"{gate}{wait}T="tmux -L {TMUX_SOCKET}"
+{action}"#,
+        gate = tmux_gate(&format!("{TTL_TMUX_VERSIONS}) ;; *) exit 0 ;;")),
+        wait = tmux_wait_session(session_key),
+    );
+    encode_wrapper(&script)
+}
+
+pub fn legacy_mode_style_command(colors: &crate::ssh::control_mode::TerminalColors) -> String {
+    let script = format!(
+        r#"{gate}tmux -L {socket} set -g mode-style '{style}' 2>/dev/null
+true"#,
+        gate = tmux_gate(&tmux_cc_arm("exit 0")),
+        socket = TMUX_SOCKET,
+        style = mode_style(colors),
+    );
+    encode_wrapper(&script)
+}
+
+/// One-shot exec that dumps the scrollback history of a persistent session,
+/// picking the backend at runtime to mirror `persistent_exec_command`.
+///
+/// tmux: `capture-pane -peJ -S -50000 -E -1` — history from 50k lines back up
+/// to just above the visible screen (`-E -1`), which the attach redraw repaints
+/// anyway. `-p` prints to stdout, `-e` preserves SGR attributes, `-J` joins
+/// wrapped lines.
+///
+/// screen: no stdout dump exists, so `hardcopy -h` writes the scrollback (plus
+/// the live screen) to a temp file. `-X` is async — the session backend writes
+/// the file — so we poll until its size settles before reading. The dump is
+/// plain text (screen strips SGR) and includes the visible viewport, so
+/// `head -n -<rows>` trims the last `pty_rows` lines to match tmux's `-E -1`
+/// and avoid duplicating the redraw. `head -n -N` is GNU coreutils; on BSD head
+/// it no-ops harmlessly (no trim).
+///
+/// Exits silently when the multiplexer or session is gone (host rebooted): the
+/// capture is empty and the caller skips replay.
+pub fn capture_history_command(session_key: &str, pty_rows: u32) -> String {
+    format!(
+        r#"if command -v tmux >/dev/null 2>&1 && tmux -L {socket} has-session -t {key} 2>/dev/null; then
+  {cc}
+  tmux -L {socket} capture-pane -t {key} -peJ -S -50000 -E -1 2>/dev/null
+elif command -v screen >/dev/null 2>&1; then
+  f=$(mktemp 2>/dev/null) || exit 0
+  screen -S {key} -X hardcopy -h "$f" 2>/dev/null
+  for i in $(seq 1 15); do
+    a=$(wc -c <"$f" 2>/dev/null); sleep 0.1; b=$(wc -c <"$f" 2>/dev/null)
+    [ "$a" = "$b" ] && break
+  done
+  head -n -{rows} "$f" 2>/dev/null
+  rm -f "$f"
+fi
+true"#,
+        socket = TMUX_SOCKET,
+        key = session_key,
+        rows = pty_rows,
+        cc = tmux_cc_case(&format!("printf {CONTROL_MODE_MARKER}; exit 0")),
+    )
+}
+
+/// One-shot exec that resolves the current working directory of a persistent
+/// session, used to drive the SFTP panel's "follow cwd" when the multiplexer
+/// swallows the shell's OSC 7: GNU screen never forwards OSC 7 to the outer
+/// terminal, and tmux consumes it for `#{pane_current_path}` rather than
+/// passing it through. tmux is queried directly; screen has no cwd query, so we
+/// descend the session's process tree to the foreground process and read
+/// `/proc/<pid>/cwd` (Linux only — screen+cwd on macOS has no /proc and is
+/// unsupported). Prints the absolute path on success, nothing otherwise.
+pub fn cwd_probe_command(session_key: &str) -> String {
+    let script = format!(
+        r#"if command -v tmux >/dev/null 2>&1 && tmux -L {socket} has-session -t {key} 2>/dev/null; then
+  tmux -L {socket} display-message -p -t {key} '#{{pane_current_path}}'
+elif command -v screen >/dev/null 2>&1; then
+  spid=$(screen -ls 2>/dev/null | grep -F .{key} | head -n1 | awk '{{print $1}}' | cut -d. -f1)
+  if [ -n "$spid" ]; then
+    pid=$spid
+{descent}
+    [ -n "$cwd" ] && printf '%s\n' "$cwd"
+  fi
+fi
+true"#,
+        socket = TMUX_SOCKET,
+        key = session_key,
+        descent = SCREEN_CWD_DESCENT,
+    );
+    encode_wrapper(&script)
+}
+
+/// Walks from `$pid` down to the foreground process, leaving the deepest usable
+/// cwd in `$cwd`. The window's wrapper sh pipes into the real shell, so the
+/// interactive shell is a grandchild — the direct child keeps a stale login cwd.
+/// Only directories that still exist count: `/proc/<pid>/cwd` resolves to
+/// `<path> (deleted)` once the directory is unlinked, so a long-lived program
+/// pinned to a since-removed directory would otherwise report a path no `cd` can
+/// reach, silently landing a session duplicated from it in the home directory.
+const SCREEN_CWD_DESCENT: &str = r#"cwd=""
+    while :; do
+      c=$(pgrep -P "$pid" 2>/dev/null | tail -n1)
+      [ -n "$c" ] || c=$(ps -o pid= --ppid "$pid" 2>/dev/null | tail -n1 | tr -d ' ')
+      [ -n "$c" ] || break
+      pid=$c
+      cur=$(readlink /proc/$pid/cwd 2>/dev/null)
+      [ -n "$cur" ] && [ -d "$cur" ] && cwd=$cur
+    done"#;
+
+/// Whether a cwd reported by [`cwd_probe_command`] can be handed to a `cd`.
+/// The probe's own `[ -d ]` guard drops unlinked directories, but a host whose
+/// `/proc` or `readlink` behaves differently can still surface the kernel's
+/// `<path> (deleted)` form; taking it would strand a duplicated session in the
+/// home directory rather than keeping the last live cwd.
+pub fn is_live_probe_cwd(path: &str) -> bool {
+    path.starts_with('/') && !path.ends_with(" (deleted)")
+}
+
+/// Conditional kill for a shared session. Kills only when at most
+/// `max_clients` clients are attached (1 when the closer's own channel is
+/// still attached, 0 when it already dropped) — another device's live attach
+/// must survive a local tab close. Prints SOLTZ_KILLED on confirmed kill,
+/// and also when the session is already gone (host rebooted: tombstoning it
+/// is accurate). No portable client count exists for screen; the frontend's
+/// manifest gate is the only protection there. Socket/server flags MUST
+/// mirror `persistent_exec_command`.
+pub fn persistent_kill_command(session_key: &str, max_clients: usize) -> String {
+    let script = format!(
+        r#"K=0
+if command -v tmux >/dev/null 2>&1 && tmux -L {socket} has-session -t {key} 2>/dev/null; then
+  if [ "$(tmux -L {socket} list-clients -t {key} 2>/dev/null | grep -c .)" -le {max} ]; then
+    tmux -L {socket} kill-session -t {key} 2>/dev/null && K=1
+  fi
+elif command -v screen >/dev/null 2>&1 && screen -ls 2>/dev/null | grep -qF .{key}; then
+  screen -S {key} -X quit >/dev/null 2>&1 && K=1
+else
+  K=1
+fi
+[ "$K" = "1" ] && printf SOLTZ_KILLED
+true"#,
+        socket = TMUX_SOCKET,
+        key = session_key,
+        max = max_clients,
+    );
+    encode_wrapper(&script)
+}
+
+/// Client count no real session reaches; keeps the `-le` guard in
+/// `persistent_kill_command` always true so a manual kill destroys the
+/// multiplexer regardless of who is attached. Stays under 2^63 for POSIX `[ ]`.
+const FORCE_KILL_CLIENTS: usize = 1_000_000;
+
+/// Unconditional variant of `persistent_kill_command` for an explicit,
+/// user-initiated destroy of a session this device is not attached to.
+pub fn force_kill_command(session_id: &str) -> String {
+    persistent_kill_command(&tmux_session_key(session_id), FORCE_KILL_CLIENTS)
+}
+
+/// Same shape as `ssh_exec_command` but encodes the WSL-flavored wrapper,
+/// which emits OSC 7 with the distro name so the frontend can route the
+/// panel to a `\\wsl.localhost\<distro>\` UNC path.
+pub fn wsl_exec_command() -> String {
+    encode_wrapper(WSL_WRAPPER)
+}
+
+fn encode_wrapper(script: &str) -> String {
+    format!("printf '{}' | sh", printf_escape(script))
+}
+
+/// `script` as a printf format any login shell passes through unchanged, inside
+/// single or double quotes. busybox builds such as OpenWrt's ship no `base64`.
+fn printf_escape(script: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(script.len() * 5 / 4);
+    for c in script.chars() {
+        if !c.is_ascii() || c.is_ascii_alphanumeric() || " -_.,:;/=+(){}[]<>|&*?#@^~".contains(c) {
+            out.push(c);
+        } else {
+            let _ = write!(out, "\\{:03o}", c as u32);
+        }
+    }
+    out
+}
+
+/// Container wrapper (docker exec / pct exec). Like SSH_WRAPPER, but:
+///   - It must survive minimal images: bash often isn't present, so the
+///     fallback is a POSIX `sh` whose `$ENV` startup file hooks OSC 7 into PS1
+///     via command substitution (`$(__soltz_pwd)` re-runs every prompt and
+///     emits the sequence — portable across dash and busybox ash).
+///   - No `</dev/tty` is needed: it's run via `eval "$(printf …)"`, so the
+///     wrapping shell keeps the container TTY on stdin and `exec sh -i`
+///     inherits it directly (no pipe to escape from).
+const CONTAINER_WRAPPER: &str = concat!(
+    r##"if command -v bash >/dev/null 2>&1; then
+  RC=$(mktemp 2>/dev/null || echo /tmp/.soltz_rc)
+  cat > "$RC" <<'EOF'
+[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
+"##,
+    bash_hooks!("file://%s%s", "$HOSTNAME"),
+    r##"EOF
+  exec bash --rcfile "$RC" -i
+else
+  ENVF=$(mktemp 2>/dev/null || echo /tmp/.soltz_env)
+  cat > "$ENVF" <<'EOF'
+PROMPT_COMMAND="__soltz_pwd"
+"##,
+    sh_hooks!(),
+    r##"EOF
+  ENV="$ENVF" exec sh -i
+fi
+"##
+);
+
+/// The argument for `sh -c '<…>'` inside a container. `eval`s the wrapper so the
+/// container TTY stays on stdin. Single-quote-free, so it can be wrapped as is.
+fn container_exec_payload() -> String {
+    format!(
+        "eval \"$(printf \"{}\")\"",
+        printf_escape(CONTAINER_WRAPPER)
+    )
+}
+
+/// The interactive shell `prefix` (`docker exec -it <cid>`, `pct exec <vmid> --`) enters.
+pub fn container_shell(prefix: &str) -> String {
+    format!("{prefix} sh -c '{}'", container_exec_payload())
+}
+
+/// WSL flavor: same structure as SSH_WRAPPER but the printf format embeds
+/// the distro into the OSC 7 path. The frontend recognizes the
+/// `wsl.localhost` host and constructs a UNC path Windows can read.
+const WSL_WRAPPER: &str = concat!(
+    r##"WSL_DISTRO_NAME="${WSL_DISTRO_NAME:-Linux}"
+export WSL_DISTRO_NAME
+case "$(basename "${SHELL:-/bin/sh}")" in
+zsh)
+  ZDOTDIR_TMP=$(mktemp -d 2>/dev/null) || exec zsh -i <&2
+  export ZDOTDIR_ORIG="${ZDOTDIR:-$HOME}"
+  cat > "$ZDOTDIR_TMP/.zshenv" <<'EOF'
+"##,
+    zsh_env!("file://wsl.localhost/%s%s", "$WSL_DISTRO_NAME"),
+    r##"EOF
+  ZDOTDIR="$ZDOTDIR_TMP" exec zsh -i <&2
+  ;;
+fish)
+  exec fish -i -C 'function __soltz_wsl_pwd --on-event fish_prompt; printf "\e]7;file://wsl.localhost/%s%s\a" "$WSL_DISTRO_NAME" "$PWD"; end' <&2
+  ;;
+*)
+  RCFILE_TMP=$(mktemp 2>/dev/null) || exec bash -i <&2
+  cat > "$RCFILE_TMP" <<'EOF'
+[ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc"
+"##,
+    bash_hooks!("file://wsl.localhost/%s%s", "$WSL_DISTRO_NAME"),
+    r##"EOF
+  exec bash --rcfile "$RCFILE_TMP" -i <&2
+  ;;
+esac
+"##
+);
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+mod tests {
+    use super::*;
+
+    fn bootstrap_format(cmd: &str) -> &str {
+        cmd.strip_prefix("printf '")
+            .and_then(|s| s.strip_suffix("' | sh"))
+            .expect("bootstrap shape")
+    }
+
+    fn decode_bootstrap(cmd: &str) -> String {
+        unescape_printf(bootstrap_format(cmd))
+    }
+
+    fn unescape_printf(escaped: &str) -> String {
+        let mut out = String::new();
+        let mut rest = escaped;
+        while let Some(i) = rest.find('\\') {
+            out.push_str(&rest[..i]);
+            out.push(u8::from_str_radix(&rest[i + 1..i + 4], 8).unwrap() as char);
+            rest = &rest[i + 4..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    #[test]
+    fn session_key_sanitizes_unsafe_chars() {
+        assert_eq!(tmux_session_key("abc-123"), "soltz_abc-123");
+        assert_eq!(tmux_session_key("a.b:c d"), "soltz_a_b_c_d");
+    }
+
+    #[test]
+    fn persistent_wrapper_embeds_inner_and_all_branches() {
+        let inner = ssh_exec_command("");
+        let cmd = persistent_exec_command("soltz_s1", &inner);
+        let script = decode_bootstrap(&cmd);
+        assert!(script.contains("command -v tmux"));
+        assert!(script.contains("tmux -L soltz"));
+        assert!(script.contains("new-session -A -s soltz_s1"));
+        // Shared sessions: creating must never detach another device's client.
+        assert!(!script.contains(" -D -s"));
+        assert!(script.contains("command -v screen"));
+        assert!(script.contains("screen -S soltz_s1"));
+        assert!(script.contains("screen -c"));
+        // #118: screen 5.0+ passes RGB through once `truecolor` is on; older
+        // screens drop `ESC[38;2;r;g;b` entirely and get the warning instead.
+        // It is prepended to $V so it prints inside the window — screen's
+        // startup clear would wipe anything written before the exec.
+        assert!(script.contains(r#"echo truecolor on >> "$SCREEN_RC""#));
+        assert!(script.contains(r#"*"Screen version "[5-9]*"#));
+        assert!(script.contains(&format!(
+            r#"V="{}; $V""#,
+            notice_printf(SCREEN_DEGRADED_NOTICE)
+        )));
+        assert!(script.contains("without TrueColor"));
+        // #159: the pane shell must not inherit multiplexer env, or the user's
+        // own tmux talks to our socket and refuses to attach.
+        assert!(script.contains(&format!(r#"V="{TMUX_ENV_STRIP}$V""#)));
+        assert!(script.contains(&format!(r#"V="{SCREEN_ENV_STRIP}$V""#)));
+        // #159: C-b belongs to whatever the user runs inside, not to us. Set on
+        // both a cold server (via -f) and one left running by a past session.
+        assert!(script.contains(r#"tmux -L soltz set -g prefix None"#));
+        assert!(script.contains(r#"echo "set -g prefix None" >> "$TMUX_CONF""#));
+        assert!(script.contains(r#"*"tmux "2.[1-9]*"#));
+        // #159 follow-up: screen's escape key belongs to whatever runs inside,
+        // pointed at a byte no key produces rather than a real chord.
+        assert!(script.contains(r"escape \377\377"));
+        // Self-heal: wipe dead entries and collapse same-named duplicates so
+        // -D -R can't fail into the "several suitable screens" reconnect loop.
+        assert!(script.contains("screen -wipe"));
+        assert!(script.contains("grep -F .soltz_s1"));
+        assert!(script.contains("-X quit"));
+        assert!(script.contains("msgwait 0"));
+        // cnorm/ve stripped of ?12l so multiplexer redraws don't disable the
+        // user's cursor-blink setting (xterm.js maps DECRST 12 to blink off).
+        assert!(script.contains("cnorm=\\E[?25h"));
+        assert!(script.contains(r"set -ga terminal-overrides ',*:cnorm=\E[?25h:Tc'"));
+        assert!(script.contains("ti@:te@:ve=\\E[?25h"));
+        assert!(script.contains("will not survive disconnects"));
+        assert!(!inner.contains('"'));
+        assert!(script.contains(&inner));
+    }
+
+    #[test]
+    fn ssh_wrapper_reproduces_motd() {
+        let decoded = decode_bootstrap(&ssh_exec_command(""));
+        assert!(decoded.contains("/run/motd.dynamic"));
+        assert!(decoded.contains("/etc/motd"));
+        assert!(decoded.contains(".hushlogin"));
+        // Quote-free so it can also be embedded in the persist inner.
+        assert!(!MOTD_PREAMBLE.contains('"'));
+    }
+
+    #[test]
+    fn ssh_wrapper_runs_the_cd_prefix_before_the_shell() {
+        let decoded = decode_bootstrap(&ssh_exec_command("cd '/srv/app' 2>/dev/null; "));
+        let cd = decoded
+            .find("cd '/srv/app'")
+            .expect("prefix is in the wrapper");
+        // Inside the decoded /bin/sh wrapper, and before it execs the login shell.
+        assert!(cd < decoded.find(SSH_WRAPPER).unwrap());
+        assert!(!decode_bootstrap(&ssh_exec_command("")).contains("cd '"));
+    }
+
+    fn bootstrap_payloads() -> Vec<String> {
+        let key = tmux_session_key("s1");
+        vec![
+            ssh_exec_command("cd '/srv/app' 2>/dev/null; "),
+            persistent_exec_command(&key, &ssh_exec_command("")),
+            persistent_attach_command(&key),
+            persistent_legacy_setup_command(&key, Some(&test_colors())),
+            cwd_probe_command(&key),
+            force_kill_command("s1"),
+            wsl_exec_command(),
+            persistent_ttl_command(&key, Some(86400)),
+            persistent_ttl_command(&key, None),
+        ]
+    }
+
+    #[test]
+    fn bootstrap_escapes_survive_any_login_shell_quoting() {
+        let mut escaped: Vec<String> = bootstrap_payloads()
+            .iter()
+            .map(|cmd| bootstrap_format(cmd).to_string())
+            .collect();
+        escaped.push(printf_escape(CONTAINER_WRAPPER));
+        for e in escaped {
+            for bad in ['\'', '"', '$', '`', '!', '%', '\n', '\t'] {
+                assert!(!e.contains(bad), "{bad:?} must be octal-escaped");
+            }
+            for (i, _) in e.match_indices('\\') {
+                assert!(
+                    e.as_bytes()[i + 1..i + 4]
+                        .iter()
+                        .all(|b| (b'0'..=b'7').contains(b)),
+                    "backslash must open a three-digit octal escape"
+                );
+            }
+        }
+        assert!(!container_exec_payload().contains('\''));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_decodes_with_plain_sh_printf() {
+        for cmd in bootstrap_payloads() {
+            let printf = cmd.strip_suffix(" | sh").unwrap();
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(printf)
+                .output()
+                .expect("sh runs");
+            assert_eq!(
+                String::from_utf8(out.stdout).unwrap(),
+                decode_bootstrap(&cmd)
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_attach_joins_without_stealing_or_creating() {
+        let script = decode_bootstrap(&persistent_attach_command("soltz_s1"));
+        assert!(script.contains("tmux -L soltz has-session -t soltz_s1"));
+        assert!(script.contains("attach-session -t soltz_s1"));
+        // Co-attach: never detach the other device, never create a session.
+        assert!(!script.contains("new-session"));
+        assert!(!script.contains("-D"));
+        assert!(script.contains("screen -x -S soltz_s1"));
+        // Re-attach over the stderr pty (`<&2`); modern tmux rejects `</dev/tty`.
+        assert!(script.contains("<&2"));
+    }
+
+    #[test]
+    fn persistent_probe_detects_both_multiplexers() {
+        let script = decode_bootstrap(&persistent_probe_command("soltz_s1"));
+        assert!(script.contains("tmux -L soltz has-session -t soltz_s1"));
+        // Dead screen entries must not read as present (attach -x would fail).
+        assert!(script.contains("screen -wipe"));
+        assert!(script.contains("grep -qF .soltz_s1"));
+        assert!(script.contains("SOLTZ_PRESENT"));
+        assert!(script.contains("SOLTZ_NOMUX"));
+        assert!(script.trim_end().ends_with("true"));
+    }
+
+    fn test_colors() -> crate::ssh::control_mode::TerminalColors {
+        crate::ssh::control_mode::TerminalColors {
+            fg: "#101820".into(),
+            bg: "#fafaf0".into(),
+            selection_fg: "#101820".into(),
+            selection_bg: "#c8d0e0".into(),
+        }
+    }
+
+    #[test]
+    fn persistent_wrapper_attaches_in_control_mode_on_tmux_3_2_and_later() {
+        let script = decode_bootstrap(&persistent_exec_command(
+            "soltz_s1",
+            &ssh_exec_command(""),
+        ));
+        assert!(script.contains(&format!("    {TMUX_CC_VERSIONS})")));
+        assert!(script.contains("CC=-CC"));
+        assert!(script.contains("S=$(stty size <&2 2>/dev/null)"));
+        assert!(script.contains(
+            r#"exec tmux -L soltz -f "$TMUX_CONF" $CC new-session -A -s soltz_s1 $SZ "$V" <&2"#
+        ));
+        assert!(script
+            .contains(r#"exec tmux -L soltz $CC new-session -A -s soltz_s1 $SZ "$V" <&2"#));
+    }
+
+    #[test]
+    fn every_branch_but_control_mode_announces_raw_output() {
+        let sentinel = r"printf '\033P1000r\033\\'";
+        for script in [
+            decode_bootstrap(&persistent_exec_command(
+                "soltz_s1",
+                &ssh_exec_command(""),
+            )),
+            decode_bootstrap(&persistent_attach_command("soltz_s1")),
+        ] {
+            assert_eq!(script.matches(sentinel).count(), 3, "{script}");
+            assert!(script.contains(&format!(r#"[ -n "$CC" ] || {sentinel}"#)));
+        }
+    }
+
+    #[test]
+    fn persistent_attach_uses_control_mode_on_tmux_3_2_and_later() {
+        let script = decode_bootstrap(&persistent_attach_command("soltz_s1"));
+        assert!(script.contains(TMUX_CC_VERSIONS));
+        assert!(script.contains("exec tmux -L soltz $CC attach-session -t soltz_s1 <&2"));
+    }
+
+    #[test]
+    fn capture_history_defers_to_the_control_mode_sync() {
+        let cmd = capture_history_command("soltz_s1", 40);
+        let marker = cmd.find("printf SOLTZ_CC").expect("marker");
+        assert!(marker < cmd.find("capture-pane").unwrap());
+        assert!(cmd.contains(TMUX_CC_VERSIONS));
+    }
+
+    #[test]
+    fn legacy_setup_only_touches_tmux_below_3_2() {
+        let script = decode_bootstrap(&persistent_legacy_setup_command(
+            "soltz_s1",
+            Some(&test_colors()),
+        ));
+        assert!(script.contains(r#"*"tmux "3.[01]*) NC=1 ;;"#));
+        assert!(script.contains(r#"*"tmux "2.[6-9]*) ;;"#));
+        assert!(script.contains("*) exit 0 ;;"));
+        assert!(script.contains("until tmux -L soltz has-session -t =soltz_s1"));
+        assert!(
+            script.contains(r"printf 'bind -T %s Enter send -X cancel \; send-keys Enter\n' $t")
+        );
+        assert!(script.contains("MouseDragEnd1Pane send -X copy-selection-no-clear"));
+        assert!(script.contains("set -g mode-style 'fg=#101820,bg=#c8d0e0'"));
+        assert!(script.contains("tmux -L soltz source-file"));
+        let plain = decode_bootstrap(&persistent_legacy_setup_command("soltz_s1", None));
+        assert!(!plain.contains("mode-style"));
+    }
+
+    #[test]
+    fn legacy_mode_style_skips_control_mode_hosts() {
+        let script = decode_bootstrap(&legacy_mode_style_command(&test_colors()));
+        assert!(script.contains(&format!("{TMUX_CC_VERSIONS}) exit 0 ;;")));
+        assert!(script.contains("tmux -L soltz set -g mode-style 'fg=#101820,bg=#c8d0e0'"));
+    }
+
+    #[test]
+    fn persistent_kill_is_conditional_and_reports() {
+        let key = tmux_session_key("s1");
+        let attached = decode_bootstrap(&persistent_kill_command(&key, 1));
+        let detached = decode_bootstrap(&persistent_kill_command(&key, 0));
+        // Kill only when no client beyond the closer's own is attached.
+        assert!(attached.contains("-le 1"));
+        assert!(detached.contains("-le 0"));
+        assert!(attached.contains("list-clients -t soltz_s1"));
+        assert!(attached.contains("tmux -L soltz kill-session -t soltz_s1"));
+        assert!(attached.contains("screen -S soltz_s1 -X quit"));
+        // Confirmed kill (or already gone) prints the sentinel for the tombstone.
+        assert!(attached.contains("SOLTZ_KILLED"));
+        assert!(attached.trim_end().ends_with("true"));
+    }
+
+    #[test]
+    fn force_kill_command_ignores_attached_clients() {
+        let decoded = decode_bootstrap(&force_kill_command("s1"));
+        // Unconditional: the client-count guard uses the force threshold.
+        assert!(decoded.contains("-le 1000000"));
+        assert!(decoded.contains("tmux -L soltz kill-session -t soltz_s1"));
+        assert!(decoded.contains("screen -S soltz_s1 -X quit"));
+        assert!(decoded.contains("SOLTZ_KILLED"));
+    }
+
+    #[test]
+    fn persistent_wrapper_keeps_pty_redirects() {
+        let inner = ssh_exec_command("");
+        let cmd = persistent_exec_command("soltz_s1", &inner);
+        let script = decode_bootstrap(&cmd);
+        // The multiplexer re-attaches over the stderr pty (`<&2`), not `/dev/tty`.
+        assert!(script.contains("<&2"));
+        assert!(script.contains("exec sh -c \"$V\" <&2"));
+        assert!(script.contains(&format!("V=\"{}\"", inner)));
+    }
+
+    #[test]
+    fn ssh_wrapper_zsh_uses_zshenv_trampoline() {
+        let decoded = decode_bootstrap(&ssh_exec_command(""));
+        assert!(
+            decoded.contains("$ZDOTDIR_TMP/.zshenv"),
+            "SSH wrapper zsh branch must write .zshenv, got:\n{decoded}"
+        );
+        assert!(
+            !decoded.contains("$ZDOTDIR_TMP/.zshrc"),
+            "SSH wrapper must not write .zshrc, got:\n{decoded}"
+        );
+        assert!(
+            decoded.contains("ZDOTDIR=\"$ZDOTDIR_ORIG\""),
+            "SSH wrapper must restore ZDOTDIR from ZDOTDIR_ORIG, got:\n{decoded}"
+        );
+        assert!(
+            decoded.contains("${ZDOTDIR:-$HOME}/.zshenv"),
+            "SSH wrapper must source real .zshenv, got:\n{decoded}"
+        );
+        assert!(
+            !decoded.contains("${ZDOTDIR_ORIG}/.zshrc"),
+            "SSH wrapper must not manually source user .zshrc, got:\n{decoded}"
+        );
+        assert!(
+            decoded.contains("file://%s%s") && decoded.contains("${HOST}"),
+            "SSH wrapper must use HOST-based OSC 7 printf, got:\n{decoded}"
+        );
+    }
+
+    #[test]
+    fn wsl_wrapper_zsh_uses_zshenv_trampoline() {
+        let decoded = decode_bootstrap(&wsl_exec_command());
+        assert!(
+            decoded.contains("$ZDOTDIR_TMP/.zshenv"),
+            "WSL wrapper zsh branch must write .zshenv, got:\n{decoded}"
+        );
+        assert!(
+            !decoded.contains("$ZDOTDIR_TMP/.zshrc"),
+            "WSL wrapper must not write .zshrc, got:\n{decoded}"
+        );
+        assert!(
+            decoded.contains("ZDOTDIR=\"$ZDOTDIR_ORIG\""),
+            "WSL wrapper must restore ZDOTDIR from ZDOTDIR_ORIG, got:\n{decoded}"
+        );
+        assert!(
+            decoded.contains("${ZDOTDIR:-$HOME}/.zshenv"),
+            "WSL wrapper must source real .zshenv, got:\n{decoded}"
+        );
+        assert!(
+            !decoded.contains("${ZDOTDIR_ORIG}/.zshrc"),
+            "WSL wrapper must not manually source user .zshrc, got:\n{decoded}"
+        );
+        assert!(
+            decoded.contains("wsl.localhost"),
+            "WSL wrapper must keep wsl.localhost printf, got:\n{decoded}"
+        );
+    }
+
+    #[test]
+    fn capture_history_dumps_tmux_history_excluding_visible_screen() {
+        let cmd = capture_history_command("soltz_s1", 40);
+        assert!(cmd.contains("tmux -L soltz capture-pane -t soltz_s1"));
+        // History only: from 50k lines back (-S) to just above the visible
+        // screen (-E -1) so the live redraw after attach doesn't duplicate.
+        assert!(cmd.contains("-S -50000"));
+        assert!(cmd.contains("-E -1"));
+        // -p print to stdout, -e keep SGR colors, -J join wrapped lines.
+        assert!(cmd.contains("-peJ"));
+        // Only run tmux when the session actually exists on the socket.
+        assert!(cmd.contains("tmux -L soltz has-session -t soltz_s1"));
+        // Missing multiplexer/session must not error the channel.
+        assert!(cmd.contains("2>/dev/null"));
+        assert!(cmd.trim_end().ends_with("true"));
+    }
+
+    #[test]
+    fn cwd_probe_queries_tmux_and_descends_screen_proc() {
+        let script = decode_bootstrap(&cwd_probe_command("soltz_s1"));
+        // tmux: query pane_current_path on our private socket/session.
+        assert!(script.contains("tmux -L soltz has-session -t soltz_s1"));
+        assert!(script.contains("display-message -p -t soltz_s1 '#{pane_current_path}'"));
+        // screen has no cwd query: find the server pid, descend the process
+        // tree, and read /proc/<pid>/cwd.
+        assert!(script.contains("screen -ls"));
+        assert!(script.contains("grep -F .soltz_s1"));
+        assert!(script.contains("pgrep -P"));
+        assert!(script.contains("ps -o pid= --ppid"));
+        assert!(script.contains("readlink /proc/$pid/cwd"));
+        // Track the last readable cwd so wrapper shells (stale login cwd) and
+        // transient/dead leaves don't win over the real interactive shell, and
+        // only count directories that still exist.
+        assert!(script.contains("[ -n \"$cur\" ] && [ -d \"$cur\" ] && cwd=$cur"));
+        // Never errors the channel; ends clean for the caller's read loop.
+        assert!(script.contains("2>/dev/null"));
+        assert!(script.trim_end().ends_with("true"));
+    }
+
+    /// The descent run for real against a three-level process tree whose deepest
+    /// process sits in a directory that is then removed under it: `/proc/<pid>/cwd`
+    /// starts resolving to `<path> (deleted)`, and reporting that would send a
+    /// duplicated session's `cd` somewhere it can never reach.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descent_ignores_a_descendant_whose_directory_was_removed() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        fn descend(start: u32) -> String {
+            let out = Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "pid={start}\n{SCREEN_CWD_DESCENT}\nprintf '%s' \"$cwd\""
+                ))
+                .output()
+                .expect("descent runs");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        }
+
+        let root = std::env::temp_dir().join(format!("soltz-descent-{}", std::process::id()));
+        let live = root.join("live");
+        let doomed = root.join("doomed");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(&doomed).unwrap();
+
+        // start -> shell in `live` -> sleep in `doomed`, mirroring screen's
+        // wrapper -> interactive shell -> foreground program.
+        let mut start = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "sh -c 'cd \"{live}\"; sh -c \"cd \\\"{doomed}\\\"; exec sleep 30\"'\n:",
+                live = live.display(),
+                doomed = doomed.display(),
+            ))
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("tree spawns");
+
+        // The tree comes up asynchronously; it is fully built once the descent
+        // reaches the deepest process. Reaching it is also what makes the rest
+        // of this test meaningful.
+        let mut built = false;
+        for _ in 0..100 {
+            if descend(start.id()) == doomed.to_string_lossy() {
+                built = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let result = if built {
+            std::fs::remove_dir(&doomed).unwrap();
+            Some(descend(start.id()))
+        } else {
+            None
+        };
+
+        // `process_group(0)` made the child its own group leader, so one signal
+        // reaps the whole tree. `--` keeps the negative pgid out of kill's flags.
+        let _ = Command::new("kill")
+            .arg("--")
+            .arg(format!("-{}", start.id()))
+            .status();
+        let _ = start.wait();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(built, "descent never reached the deepest process");
+        // The removed directory is skipped, so the shell's live cwd stands.
+        assert_eq!(result.unwrap(), live.to_string_lossy());
+    }
+
+    #[test]
+    fn probe_cwd_must_be_an_absolute_live_path() {
+        assert!(is_live_probe_cwd("/home/user/project"));
+        // The kernel's marker for an unlinked directory — no `cd` can reach it.
+        assert!(!is_live_probe_cwd("/home/user/worktrees/gone (deleted)"));
+        // Probe output when the multiplexer or session is missing.
+        assert!(!is_live_probe_cwd(""));
+        assert!(!is_live_probe_cwd("screen: command not found"));
+    }
+
+    #[test]
+    fn capture_history_falls_back_to_screen_hardcopy() {
+        let cmd = capture_history_command("soltz_s1", 40);
+        // screen has no stdout dump; hardcopy -h writes scrollback to a temp file.
+        assert!(cmd.contains("screen -S soltz_s1 -X hardcopy -h"));
+        // Trim the live viewport (pty_rows) so the attach redraw isn't duplicated.
+        assert!(cmd.contains("head -n -40"));
+        // Gated behind screen availability, after the tmux branch.
+        assert!(cmd.contains("elif command -v screen >/dev/null 2>&1; then"));
+    }
+
+    #[test]
+    fn prepare_local_zsh_writes_zshenv() {
+        let session_id = format!("test-zshenv-{}", std::process::id());
+        let result = prepare_local("/bin/zsh", &session_id).expect("prepare_local failed");
+        let integration = result.expect("expected Some(LocalIntegration) for zsh");
+
+        let zdotdir = integration
+            .env
+            .iter()
+            .find(|(k, _)| k == "ZDOTDIR")
+            .map(|(_, v)| std::path::PathBuf::from(v))
+            .expect("ZDOTDIR env var not set");
+
+        let zshenv_path = zdotdir.join(".zshenv");
+        assert!(
+            zshenv_path.exists(),
+            ".zshenv must be written at {zshenv_path:?}"
+        );
+        assert!(
+            !zdotdir.join(".zshrc").exists(),
+            ".zshrc must not be written, got it at {:?}",
+            zdotdir.join(".zshrc")
+        );
+
+        let content = std::fs::read_to_string(&zshenv_path).expect("failed to read .zshenv");
+        assert!(
+            content.contains("${ZDOTDIR:-$HOME}/.zshenv"),
+            ".zshenv must source real .zshenv, got:\n{content}"
+        );
+        assert!(
+            content.contains("ZDOTDIR=\"$ZDOTDIR_ORIG\""),
+            ".zshenv must restore ZDOTDIR, got:\n{content}"
+        );
+
+        cleanup(&integration.tempfiles);
+        assert!(!zdotdir.exists(), "cleanup must remove temp dir");
+    }
+
+    #[test]
+    fn prepare_local_bash_passes_long_option_before_short() {
+        // GNU bash rejects a `--long` option that appears after a short option
+        // (`bash -i --rcfile FILE` => "bash: --: invalid option"). The rcfile
+        // long option must come before `-i`.
+        let session_id = format!("test-bashrc-{}", std::process::id());
+        let integration = prepare_local("/usr/bin/bash", &session_id)
+            .expect("prepare_local failed")
+            .expect("expected Some(LocalIntegration) for bash");
+
+        let rcfile_pos = integration
+            .args
+            .iter()
+            .position(|a| a == "--rcfile")
+            .expect("--rcfile arg missing");
+        let i_pos = integration
+            .args
+            .iter()
+            .position(|a| a == "-i")
+            .expect("-i arg missing");
+        assert!(
+            rcfile_pos < i_pos,
+            "--rcfile must precede -i, got args: {:?}",
+            integration.args
+        );
+
+        cleanup(&integration.tempfiles);
+    }
+
+    #[test]
+    fn wrappers_reattach_pty_via_stderr_not_dev_tty() {
+        // Reopening the tty by path (`</dev/tty`) yields a *different* file
+        // description that sudo's `use_pty` relay fails to recognize, silently
+        // losing most keystrokes inside `sudo -i`. Duplicating stderr (`<&2`)
+        // keeps sshd's original pty fd. Mirrors `persistent_exec_command`.
+        for (name, wrapper) in [("SSH_WRAPPER", SSH_WRAPPER), ("WSL_WRAPPER", WSL_WRAPPER)] {
+            assert!(
+                wrapper.contains("<&2"),
+                "{name} must re-attach the pty via `<&2`"
+            );
+            assert!(
+                !wrapper.contains("</dev/tty"),
+                "{name} must not reopen the tty by path (`</dev/tty`) — it breaks sudo -i"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_and_zsh_wrappers_carry_prompt_marks() {
+        let container = unescape_printf(&printf_escape(CONTAINER_WRAPPER));
+        for script in [
+            BASH_RC.to_string(),
+            ZSH_ZSHENV.to_string(),
+            decode_bootstrap(&ssh_exec_command("")),
+            decode_bootstrap(&wsl_exec_command()),
+            container,
+        ] {
+            assert!(script.contains(r"\e]133;D;%s\a\e]133;A\a\e]7;file://"));
+            assert!(script.contains(r"\e]133;C\a"));
+        }
+        assert!(BASH_RC.contains("PS0="));
+        assert!(ZSH_ZSHENV.contains("preexec_functions+=(__soltz_run)"));
+        assert!(!sh_hooks!().contains("133;"));
+        assert!(PWSH_SCRIPT.contains("']133;D;' + $code"));
+        assert!(PWSH_SCRIPT.contains("']133;C'"));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_hooked(shell_command: &str, hooks: &str, rc_name: &str, input: &str) -> String {
+        static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "soltz-marks-{}-{}",
+            std::process::id(),
+            RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(rc_name), hooks).unwrap();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '{input}' | {shell_command} 2>&1"))
+            .env("RC_DIR", &dir)
+            .output()
+            .expect("sh runs");
+        let _ = std::fs::remove_dir_all(&dir);
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn prompt_marks(shell_command: &str, hooks: &str, rc_name: &str) -> Vec<String> {
+        run_hooked(shell_command, hooks, rc_name, "true\\nfalse\\n\\n")
+            .split("\x1b]133;")
+            .skip(1)
+            .filter_map(|rest| rest.split('\x07').next().map(str::to_string))
+            .collect()
+    }
+
+    // One D;A pair from the rc's own call, then per line: C when a command
+    // ran, and the D that reports it. The empty line re-reports the last status.
+    #[cfg(target_os = "linux")]
+    const EXPECTED_MARKS: [&str; 12] = [
+        "D;0", "A", "D;0", "A", "C", "D;0", "A", "C", "D;1", "A", "D;1", "A",
+    ];
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bash_hooks_mark_each_command() {
+        let marks = prompt_marks(
+            r#"bash --rcfile "$RC_DIR/rc" -i"#,
+            bash_hooks!("file://%s%s", "$HOSTNAME"),
+            "rc",
+        );
+        assert_eq!(marks, EXPECTED_MARKS);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bash_prompt_starts_on_a_fresh_line_after_unterminated_output() {
+        let run = |columns: &str| {
+            run_hooked(
+                &format!(r#"env {columns} bash --rcfile "$RC_DIR/rc" -i"#),
+                bash_hooks!("file://%s%s", "$HOSTNAME"),
+                "rc",
+                "printf x\\n",
+            )
+        };
+        let sized = run("COLUMNS=10");
+        assert!(
+            sized.contains("x\x1b[7m%\x1b[m         \r\x1b[K\x1b]133;D;0\x07"),
+            "{sized:?}"
+        );
+        // Readline sets COLUMNS at the first prompt; only the rc's own call can lack it.
+        let unknown = run("-u COLUMNS");
+        let rc_call = unknown.split("\x1b]133;D").next().unwrap_or_default();
+        assert!(!rc_call.contains('%'), "{unknown:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zsh_hooks_mark_each_command() {
+        let has_zsh = std::process::Command::new("sh")
+            .args(["-c", "command -v zsh"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !has_zsh {
+            return;
+        }
+        let marks = prompt_marks(
+            r#"ZDOTDIR="$RC_DIR" zsh -i"#,
+            zsh_hooks!("file://%s%s", "${HOST}"),
+            ".zshenv",
+        );
+        assert_eq!(marks, EXPECTED_MARKS);
+    }
+
+    #[test]
+    fn persistent_exec_command_fits_dropbear_max_string_len() {
+        // dropbear exits the connection with "String too long" past 9000 bytes,
+        // which surfaces as a hang just after auth (#85). Inlining `inner` at
+        // each branch put this at ~21.7 KB against OpenWrt/ImmortalWrt routers.
+        let key = tmux_session_key("0f8b1c22-4d7e-4a19-9f3b-2c6d5e8a7b41");
+        for inner in [
+            ssh_exec_command(""),
+            format!("{MOTD_PREAMBLE}; exec ${{SHELL:-/bin/sh}} -l"),
+        ] {
+            let cmd = persistent_exec_command(&key, &inner);
+            assert!(
+                cmd.len() <= MAX_EXEC_COMMAND_LEN,
+                "exec payload {} exceeds {MAX_EXEC_COMMAND_LEN}",
+                cmd.len()
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_exec_command_binds_inner_once() {
+        // The size fix only holds while `inner` is referenced through `$V`;
+        // re-inlining it at the five branches silently restores the overflow.
+        let inner = "printf soltz-inner-marker";
+        let decoded = decode_bootstrap(&persistent_exec_command(&tmux_session_key("abc"), inner));
+        assert_eq!(
+            decoded.matches(inner).count(),
+            1,
+            "inner must appear once (bound to $V), got:\n{decoded}"
+        );
+        assert!(
+            decoded.matches("\"$V\"").count() >= 5,
+            "each branch uses $V"
+        );
+    }
+
+    #[test]
+    fn ttl_command_arms_hook_with_seconds() {
+        let s = decode_bootstrap(&persistent_ttl_command("soltz_s1", Some(86400)));
+        assert!(s.contains("set -t =soltz_s1: @soltz_ttl 86400 "));
+        assert!(s.contains("set-hook -t =soltz_s1: client-detached"));
+        assert!(s.contains(&format!("set -g {TTL_REAPER_OPTION} ")));
+        assert!(s.contains("until tmux -L soltz has-session -t =soltz_s1"));
+        assert!(!s.contains("set-hook -u"));
+    }
+
+    #[test]
+    fn ttl_command_clamps_ttl_to_nine_digits() {
+        let s = decode_bootstrap(&persistent_ttl_command("soltz_s1", Some(u64::MAX)));
+        assert!(s.contains("@soltz_ttl 999999999 "));
+    }
+
+    #[test]
+    fn ttl_command_off_disarms() {
+        let s = decode_bootstrap(&persistent_ttl_command("soltz_s1", None));
+        assert!(s.contains("set-hook -u -t =soltz_s1: client-detached"));
+        assert!(s.contains("set -u -t =soltz_s1: @soltz_ttl"));
+        assert!(!s.contains(TTL_REAPER_OPTION));
+    }
+
+    #[test]
+    fn ttl_command_fits_dropbear_max_string_len() {
+        let key = tmux_session_key("0f8b1c22-4d7e-4a19-9f3b-2c6d5e8a7b41");
+        let len = persistent_ttl_command(&key, Some(u64::MAX)).len();
+        assert!(len <= MAX_EXEC_COMMAND_LEN, "ttl payload is {len} bytes");
+    }
+
+    #[test]
+    fn ttl_reaper_is_self_contained_and_never_ends_a_tmux_argument_with_a_semicolon() {
+        assert!(TTL_REAPER.starts_with(TTL_IDLE_CHECK));
+        assert!(TTL_REAPER.trim_end().ends_with("\nexit 0"));
+        assert!(TTL_REAPER.contains(&format!("T=\"tmux -L {TMUX_SOCKET}\"")));
+        assert!(!TTL_REAPER.contains("$TMUX"));
+    }
+
+    #[cfg(unix)]
+    fn ttl_scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("soltz-ttl-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn ps_fixture(dir: &std::path::Path, ps: &str) -> String {
+        let path = dir.join("ps");
+        std::fs::write(&path, format!("1 0 S init init\n{ps}")).unwrap();
+        format!("cat {}", path.display())
+    }
+
+    #[cfg(unix)]
+    const FAKE_PS: &str = "#!/bin/sh\nexec sh -c \"$FAKE_PS\"\n";
+
+    #[cfg(unix)]
+    fn fake_bin_path(dir: &std::path::Path, bins: &[(&str, &str)]) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        for (name, body) in bins {
+            let bin = dir.join(name);
+            std::fs::write(&bin, body).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        format!(
+            "{}:{}",
+            dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        )
+    }
+
+    #[cfg(unix)]
+    fn ttl_check(ps_cmd: &str, proc_dir: &std::path::Path, call: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("{TTL_IDLE_CHECK}\n{call}"))
+            .env(
+                "PATH",
+                fake_bin_path(&proc_dir.join("bin"), &[("ps", FAKE_PS)]),
+            )
+            .env("FAKE_PS", ps_cmd)
+            .env("SOLTZ_PROC", proc_dir);
+        cmd
+    }
+
+    #[cfg(unix)]
+    fn run_ttl_check(ps_cmd: &str, proc_dir: &std::path::Path, call: &str) -> std::process::Output {
+        ttl_check(ps_cmd, proc_dir, call).output().expect("sh runs")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_check_classifies_process_trees() {
+        let wrapper = "10 1 S bash bash -c unset TMUX TMUX_PANE; printf '\\043!/bin/sh' | sh\n";
+        let rcfile = "11 10 S bash bash --rcfile /tmp/tmp.Xy12 -i\n";
+        #[rustfmt::skip]
+        let cases = [
+            ("10 1 S -bash -bash\n".to_string(), "10", true),
+            ("10 1 S sh sh -c V\n11 10 S bash bash -l\n".into(), "10", true),
+            ("10 1 S bash -bash\n11 10 S sudo sudo -i\n12 11 S bash -bash\n".into(), "10", true),
+            ("10 1 S zsh -zsh\n11 10 S gitstatusd-linu gitstatusd-linux-x86_64 -s 1\n".into(), "10", true),
+            ("10 1 S bash -bash\n11 10 S claude claude\n".into(), "10", false),
+            ("10 1 S bash -bash\n11 10 S sleep sleep 1000\n".into(), "10", false),
+            ("10 1 S bash -bash\n11 10 S bash bash backup.sh\n".into(), "10", false),
+            ("10 1 S bash -bash\n11 10 S sh sh -c rsync\n".into(), "10", false),
+            ("10 1 S bash -bash\n11 10 S backup.sh /bin/bash ./backup.sh\n".into(), "10", false),
+            ("10 1 R bash -bash\n".into(), "10", false),
+            ("10 1 S bash -bash\n11 10 S sudo sudo -i\n12 11 S bash -bash\n13 12 S make make\n".into(), "10", false),
+            ("99 1 S bash -bash\n".into(), "10", false),
+            (format!("{wrapper}{rcfile}"), "10", true),
+            (format!("{wrapper}12 10 S bash bash -c unset TMUX\n{rcfile}"), "10", true),
+            (format!("{wrapper}11 10 S zsh zsh -l -i\n"), "10", true),
+            (format!("{wrapper}{rcfile}12 11 S bash bash backup.sh\n"), "10", false),
+            (format!("{wrapper}{rcfile}12 11 S bash bash -ic true\n"), "10", false),
+            (format!("{wrapper}{rcfile}12 11 S sh sh -c V\n13 12 S bash -bash\n"), "10", false),
+            (format!("{wrapper}11 10 S bash bash backup.sh\n"), "10", false),
+            (format!("{wrapper}11 10 S vim vim\n"), "10", false),
+            ("10 1 S bash -bash\n20 1 S bash -bash\n".into(), "10 20", true),
+            ("10 1 S bash -bash\n20 1 S bash -bash\n21 20 S top top\n".into(), "10 20", false),
+            ("10 1 S bash -bash\n".into(), "10 20", false),
+            ("10 1 S bash -bash\n".into(), "", false),
+            ("10 root 0:00 -bash\n11 root 0:00 sleep 100\n".into(), "10", false),
+            ("PID PPID STAT COMMAND COMMAND\n10 1 S bash -bash\n".into(), "10", false),
+            (format!("{wrapper}{rcfile}12 11 S fish fish --command=make\n"), "10", false),
+            (format!("{wrapper}{rcfile}12 11 S bash bash -s\n"), "10", false),
+        ];
+        let dir = ttl_scratch("idle");
+        for (ps, panes, idle) in &cases {
+            let out = run_ttl_check(
+                &ps_fixture(&dir, ps),
+                &dir,
+                &format!("soltz_idle {panes}"),
+            );
+            assert_eq!(out.status.success(), *idle, "panes {panes:?} over:\n{ps}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_check_treats_unreadable_ps_as_busy() {
+        let dir = ttl_scratch("ps-fail");
+        for ps in [
+            "false",
+            "true",
+            "printf 'PID USER TIME COMMAND\\n'",
+            "printf '10 1 S bash -bash\\n'",
+        ] {
+            let out = run_ttl_check(ps, &dir, "soltz_idle 10");
+            assert!(!out.status.success(), "{ps} must read as busy");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_check_reads_untruncated_args_whatever_columns_says() {
+        let dir = ttl_scratch("columns");
+        let table = ps_fixture(&dir, "10 1 S bash -bash\n20 10 S bash bash -i -c make\n");
+        let ps = format!("{table} | cut -c1-${{COLUMNS:-999}}");
+        let out = ttl_check(&ps, &dir, "soltz_idle 10")
+            .env("COLUMNS", "20")
+            .output()
+            .expect("sh runs");
+        assert!(
+            !out.status.success(),
+            "a -c child cut off by COLUMNS must stay busy"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn quiet_check_reads_cpu_and_fails_closed() {
+        let dir = ttl_scratch("quiet");
+        let ps = ps_fixture(
+            &dir,
+            "10 1 S bash bash -c V\n11 10 S bash -bash\n12 11 S gitstatusd-linu gitstatusd\n",
+        );
+        let stat = |pid: &str, body: &str| {
+            std::fs::create_dir_all(dir.join(pid)).unwrap();
+            std::fs::write(dir.join(pid).join("stat"), body).unwrap();
+        };
+        stat(
+            "10",
+            "10 (ba) (sh) S 1 10 10 0 -1 4194560 100 0 0 0 7 5 0 0 20 0 1 0 100 0 0\n",
+        );
+        stat(
+            "11",
+            "11 (bash) S 10 11 11 0 -1 4194560 100 0 0 0 30 12 0 0 20 0 1 0 100 0 0\n",
+        );
+        let out = run_ttl_check(&ps, &dir, "soltz_quiet 10");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "54");
+
+        stat("11", "11 (bash) S 10 11 11\n");
+        assert!(!run_ttl_check(&ps, &dir, "soltz_quiet 10")
+            .status
+            .success());
+
+        std::fs::remove_file(dir.join("11").join("stat")).unwrap();
+        assert!(!run_ttl_check(&ps, &dir, "soltz_quiet 10")
+            .status
+            .success());
+
+        let busy = ps_fixture(&dir, "10 1 S bash -bash\n11 10 S make make\n");
+        assert!(!run_ttl_check(&busy, &dir, "soltz_quiet 10")
+            .status
+            .success());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    const FAKE_TMUX: &str = r#"#!/bin/sh
+for a; do printf '%s\037' "$a"; done >> "$LOG"
+printf '\036' >> "$LOG"
+[ "$1" = -V ] && { echo "$TMUX_V"; exit 0; }
+shift 2
+case "$1" in
+  has-session) exit "${HAS:-0}" ;;
+  display) echo "${ATT:-0}" ;;
+  show) case "$*" in
+    *@soltz_ttl*) v=$TTL; [ -f "$LOG.ttl" ] && v=$(cat "$LOG.ttl"); [ -n "$v" ] || exit 1; echo "$v" ;;
+    *@soltz_detached_at*) if [ -n "$STAMP" ]; then echo "$STAMP"; else cat "$LOG.stamp"; fi ;;
+  esac ;;
+  set) [ "$4" = @soltz_detached_at ] && printf %s "$5" > "$LOG.stamp" ;;
+  list-panes) echo 10 ;;
+esac
+exit 0
+"#;
+
+    #[cfg(unix)]
+    const FAKE_SLEEP: &str = r#"#!/bin/sh
+printf 'sleep\037%s\037\036' "$1" >> "$LOG"
+echo $(($(cat "$LOG.now" 2>/dev/null || echo 1000) + $1)) > "$LOG.now"
+c=$(($(cat "$LOG.n" 2>/dev/null || echo 0) + 1))
+echo $c > "$LOG.n"
+[ "$c" = "${FLIP_AT:-}" ] && printf %s "$FLIP_VAL" > "$LOG.$FLIP"
+exit 0
+"#;
+
+    #[cfg(unix)]
+    const FAKE_DATE: &str = "#!/bin/sh\ncat \"$LOG.now\" 2>/dev/null || echo 1000\n";
+
+    #[cfg(unix)]
+    fn run_fake_tmux(
+        sh_args: &[&str],
+        env: &[(&str, &str)],
+    ) -> (std::process::Output, Vec<Vec<String>>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static RUN: AtomicUsize = AtomicUsize::new(0);
+        let dir = ttl_scratch(&format!("tmux-{}", RUN.fetch_add(1, Ordering::Relaxed)));
+        let path = fake_bin_path(
+            &dir,
+            &[
+                ("tmux", FAKE_TMUX),
+                ("sleep", FAKE_SLEEP),
+                ("date", FAKE_DATE),
+                ("ps", FAKE_PS),
+            ],
+        );
+        let log = dir.join("log");
+        let out = std::process::Command::new("sh")
+            .args(sh_args)
+            .env("PATH", path)
+            .env("LOG", &log)
+            .envs(env.iter().copied())
+            .output()
+            .expect("sh runs");
+        let calls = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .split('\x1e')
+            .filter(|c| !c.is_empty())
+            .map(|c| {
+                c.trim_end_matches('\x1f')
+                    .split('\x1f')
+                    .map(String::from)
+                    .collect()
+            })
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        (out, calls)
+    }
+
+    #[cfg(unix)]
+    fn fake_tmux_calls(version: &str, cmd: &str) -> Vec<Vec<String>> {
+        let (out, calls) = run_fake_tmux(&["-c", cmd], &[("TMUX_V", version)]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        calls
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ttl_command_hands_tmux_the_reaper_and_hook_verbatim() {
+        let tmux = |args: &[&str]| -> Vec<String> {
+            ["-L", "soltz"]
+                .iter()
+                .chain(args)
+                .map(|s| s.to_string())
+                .collect()
+        };
+        let armed = fake_tmux_calls(
+            "tmux 3.4",
+            &persistent_ttl_command("soltz_s1", Some(3600)),
+        );
+        assert!(armed.contains(&tmux(&[
+            "set",
+            "-g",
+            TTL_REAPER_OPTION,
+            &ttl_reaper_option()
+        ])));
+        assert!(armed.contains(&tmux(&[
+            "set",
+            "-t",
+            "=soltz_s1:",
+            "@soltz_ttl",
+            "3600"
+        ])));
+        assert!(armed.contains(&tmux(&[
+            "set-hook",
+            "-t",
+            "=soltz_s1:",
+            "client-detached",
+            r#"run-shell -b "sh -c \"\$(printf \"\$(tmux -L soltz show -gv @soltz_reap1)\")\" soltz-reap #{session_name} >/dev/null 2>&1 || :""#,
+        ])));
+
+        let off = fake_tmux_calls("tmux 3.2a", &persistent_ttl_command("soltz_s1", None));
+        assert!(off.contains(&tmux(&[
+            "set-hook",
+            "-u",
+            "-t",
+            "=soltz_s1:",
+            "client-detached"
+        ])));
+        assert!(off.contains(&tmux(&["set", "-u", "-t", "=soltz_s1:", "@soltz_ttl"])));
+
+        for old in ["tmux 2.9a", "tmux 3.0a", "tmux 3.1c", "tmux next-3.5", ""] {
+            let calls = fake_tmux_calls(old, &persistent_ttl_command("soltz_s1", Some(3600)));
+            assert!(
+                calls.iter().all(|c| c.len() == 1),
+                "{old:?} must stop after -V: {calls:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ttl_reaper_option_decodes_back_with_printf() {
+        let out = std::process::Command::new("sh")
+            .args(["-c", r#"printf "$1""#, "x", &ttl_reaper_option()])
+            .output()
+            .expect("sh runs");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), TTL_REAPER);
+        assert!(ttl_reaper_option()
+            .chars()
+            .all(|c| c.is_ascii_graphic() || c == ' '));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ttl_reaper_parses_as_posix_sh() {
+        let out = std::process::Command::new("sh")
+            .arg("-n")
+            .arg("-c")
+            .arg(TTL_REAPER)
+            .output()
+            .expect("sh runs");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    fn reaper_fixture(name: &str) -> (std::path::PathBuf, String, String) {
+        let dir = ttl_scratch(name);
+        std::fs::create_dir_all(dir.join("10")).unwrap();
+        std::fs::write(
+            dir.join("10").join("stat"),
+            "10 (bash) S 1 10 10 0 -1 0 0 0 0 0 3 4 0\n",
+        )
+        .unwrap();
+        let busy_path = dir.join("busy");
+        std::fs::write(&busy_path, "10 1 S bash -bash\n11 10 S vim vim\n").unwrap();
+        let idle = ps_fixture(&dir, "10 1 S bash -bash\n");
+        (dir, idle, format!("cat {}", busy_path.display()))
+    }
+
+    #[cfg(unix)]
+    fn run_reaper(
+        dir: &std::path::Path,
+        session: &str,
+        ps: &str,
+        env: &[(&str, &str)],
+    ) -> Vec<Vec<String>> {
+        let proc_dir = dir.to_string_lossy().into_owned();
+        let mut all = vec![("TTL", "0"), ("SOLTZ_PROC", &proc_dir), ("FAKE_PS", ps)];
+        all.extend_from_slice(env);
+        let (out, calls) = run_fake_tmux(&["-c", TTL_REAPER, "soltz-reap", session], &all);
+        assert!(
+            out.status.success(),
+            "reaper must exit 0 ({env:?}): {calls:?}"
+        );
+        calls
+    }
+
+    #[cfg(unix)]
+    fn reaper_killed(calls: &[Vec<String>]) -> bool {
+        calls.contains(
+            &["-L", "soltz", "kill-session", "-t", "=soltz_s1"]
+                .map(String::from)
+                .to_vec(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reaper_kills_only_an_idle_detached_session_it_still_owns() {
+        let (dir, idle, busy) = reaper_fixture("reaper");
+        #[rustfmt::skip]
+        let cases = [
+            ("soltz_s1", &idle, ("", ""), true),
+            ("soltz_s1", &busy, ("", ""), false),
+            ("soltz_s1", &idle, ("STAMP", "1.1"), false),
+            ("soltz_s1", &idle, ("ATT", "1"), false),
+            ("soltz_s1", &idle, ("TTL", ""), false),
+            ("soltz_s1", &idle, ("TTL", "9999999999"), false),
+            ("soltz_s1", &idle, ("TTL", "000000008"), false),
+            ("soltz_s1", &idle, ("HAS", "1"), false),
+            ("work", &idle, ("", ""), false),
+        ];
+        for (session, ps, tweak, killed) in cases {
+            let env: &[(&str, &str)] = if tweak.0.is_empty() { &[] } else { &[tweak] };
+            let calls = run_reaper(&dir, session, ps, env);
+            assert_eq!(
+                reaper_killed(&calls),
+                killed,
+                "{session} {tweak:?}: {calls:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reaper_sleeps_in_bounded_chunks_and_rechecks_between_them() {
+        let (dir, idle, _) = reaper_fixture("chunks");
+        let sleeps = |calls: &[Vec<String>]| -> Vec<String> {
+            calls
+                .iter()
+                .filter(|c| c[0] == "sleep")
+                .map(|c| c[1].clone())
+                .collect()
+        };
+        let calls = run_reaper(&dir, "soltz_s1", &idle, &[("TTL", "601")]);
+        assert_eq!(sleeps(&calls), ["300", "300", "1", "5", "5"]);
+        assert!(reaper_killed(&calls));
+        for (flip, value) in [("ttl", "600"), ("ttl", ""), ("stamp", "1.1")] {
+            let env = [
+                ("TTL", "601"),
+                ("FLIP_AT", "2"),
+                ("FLIP", flip),
+                ("FLIP_VAL", value),
+            ];
+            let calls = run_reaper(&dir, "soltz_s1", &idle, &env);
+            assert_eq!(sleeps(&calls), ["300", "300"], "{flip}={value:?}");
+            assert!(!reaper_killed(&calls), "{flip}={value:?}: {calls:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_check_terminates_on_a_self_parented_pid() {
+        let dir = ttl_scratch("cycle");
+        let mut child = ttl_check(
+            &ps_fixture(&dir, "10 10 S bash -bash\n"),
+            &dir,
+            "soltz_idle 10",
+        )
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("sh runs");
+        let mut done = None;
+        for _ in 0..100 {
+            done = child.try_wait().unwrap();
+            if done.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if done.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(done.is_some(), "soltz_idle must not loop on a pid cycle");
+    }
+}

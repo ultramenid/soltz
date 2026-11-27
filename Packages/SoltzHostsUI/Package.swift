@@ -1,0 +1,20 @@
+// swift-tools-version: 6.0
+// SPDX-License-Identifier: AGPL-3.0-only
+import PackageDescription
+
+let package = Package(
+    name: "SoltzHostsUI",
+    platforms: [.macOS("27.0")],
+    products: [.library(name: "SoltzHostsUI", targets: ["SoltzHostsUI"])],
+    dependencies: [.package(path: "../SoltzModel")],
+    targets: [
+        .target(name: "SoltzHostsUI", dependencies: ["SoltzModel"]),
+        .testTarget(
+            name: "SoltzHostsUITests",
+            dependencies: ["SoltzHostsUI", "SoltzModel"],
+            // shortcut: with Command Line Tools only, swiftbuild does not hand Swift Testing's macro plugin
+            // to the compiler; drop this once plain `swift test` finds it unaided.
+            swiftSettings: [.unsafeFlags(["-plugin-path", "/Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing"])]
+        ),
+    ]
+)

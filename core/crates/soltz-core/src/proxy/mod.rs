@@ -1,0 +1,261 @@
+mod http;
+mod https;
+mod socks;
+pub mod system;
+#[cfg(test)]
+mod tests;
+
+use http::PrefixedStream;
+use serde::Deserialize;
+use std::fmt;
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
+use tokio_rustls::client::TlsStream;
+use tokio_socks::tcp::Socks5Stream;
+
+pub const PROXY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProxySpec {
+    Direct,
+    System,
+    Socks5(ProxyEndpoint),
+    Http(ProxyEndpoint),
+    Https(ProxyEndpoint),
+}
+
+pub enum ProxiedStream {
+    Tcp(TcpStream),
+    Socks(Socks5Stream<TcpStream>),
+    Http(PrefixedStream<TcpStream>),
+    Https(Box<PrefixedStream<TlsStream<TcpStream>>>),
+}
+
+pub struct Dialed {
+    pub stream: ProxiedStream,
+    pub via: Option<String>,
+}
+
+pub async fn dial(spec: Option<&ProxySpec>, host: &str, port: u16) -> Result<Dialed, ProxyError> {
+    dial_with_timeout(spec, host, port, PROXY_HANDSHAKE_TIMEOUT).await
+}
+
+pub(crate) async fn resolve_spec(
+    spec: Option<&ProxySpec>,
+    host: &str,
+    port: u16,
+) -> Option<ProxySpec> {
+    match spec {
+        Some(ProxySpec::System) => {
+            let target = host.to_string();
+            tokio::task::spawn_blocking(move || system::detect(&target, port))
+                .await
+                .ok()
+                .flatten()
+        }
+        other => other.cloned(),
+    }
+}
+
+pub(crate) async fn dial_with_timeout(
+    spec: Option<&ProxySpec>,
+    host: &str,
+    port: u16,
+    limit: Duration,
+) -> Result<Dialed, ProxyError> {
+    let resolved = resolve_spec(spec, host, port).await;
+    match resolved.as_ref() {
+        None | Some(ProxySpec::Direct) | Some(ProxySpec::System) => {
+            tokio::time::timeout(limit, TcpStream::connect((host, port)))
+                .await
+                .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
+                .map(|s| Dialed {
+                    stream: ProxiedStream::Tcp(s),
+                    via: None,
+                })
+                .map_err(ProxyError::Direct)
+        }
+        Some(ProxySpec::Socks5(ep)) => {
+            let stream = bounded(ep, limit, socks::connect(ep, host, port)).await?;
+            Ok(Dialed::through("socks5", ep, ProxiedStream::Socks(stream)))
+        }
+        Some(ProxySpec::Http(ep)) => {
+            let stream = bounded(ep, limit, async {
+                http::connect(open(ep).await?, ep.label(), host, port, ep.auth()).await
+            })
+            .await?;
+            Ok(Dialed::through("http", ep, ProxiedStream::Http(stream)))
+        }
+        Some(ProxySpec::Https(ep)) => {
+            let config = crate::tls::client_config().map_err(|detail| ProxyError::Protocol {
+                proxy: ep.label(),
+                detail,
+            })?;
+            let stream = bounded(ep, limit, https::connect(ep, config, host, port)).await?;
+            Ok(Dialed::through(
+                "https",
+                ep,
+                ProxiedStream::Https(Box::new(stream)),
+            ))
+        }
+    }
+}
+
+impl Dialed {
+    fn through(scheme: &str, ep: &ProxyEndpoint, stream: ProxiedStream) -> Self {
+        Self {
+            stream,
+            via: Some(format!("{scheme} {}", ep.label())),
+        }
+    }
+}
+
+async fn open(ep: &ProxyEndpoint) -> Result<TcpStream, ProxyError> {
+    TcpStream::connect((ep.host.as_str(), ep.port))
+        .await
+        .map_err(|source| ProxyError::Unreachable {
+            proxy: ep.label(),
+            source,
+        })
+}
+
+async fn bounded<T>(
+    ep: &ProxyEndpoint,
+    limit: Duration,
+    fut: impl std::future::Future<Output = Result<T, ProxyError>>,
+) -> Result<T, ProxyError> {
+    tokio::time::timeout(limit, fut)
+        .await
+        .unwrap_or_else(|_| Err(ProxyError::Timeout { proxy: ep.label() }))
+}
+
+macro_rules! each_stream {
+    ($self:ident, $s:ident => $e:expr) => {
+        match $self.get_mut() {
+            ProxiedStream::Tcp($s) => $e,
+            ProxiedStream::Socks($s) => $e,
+            ProxiedStream::Http($s) => $e,
+            ProxiedStream::Https($s) => $e,
+        }
+    };
+}
+
+impl AsyncRead for ProxiedStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        each_stream!(self, s => Pin::new(s).poll_read(cx, buf))
+    }
+}
+
+impl AsyncWrite for ProxiedStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        each_stream!(self, s => Pin::new(s).poll_write(cx, buf))
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        each_stream!(self, s => Pin::new(s).poll_flush(cx))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        each_stream!(self, s => Pin::new(s).poll_shutdown(cx))
+    }
+}
+
+#[derive(Clone, Deserialize, PartialEq)]
+pub struct ProxyEndpoint {
+    pub host: String,
+    pub port: u16,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+impl ProxyEndpoint {
+    pub fn label(&self) -> String {
+        authority(&self.host, self.port)
+    }
+
+    pub fn auth(&self) -> Option<(&str, &str)> {
+        let user = self.username.as_deref().filter(|u| !u.is_empty())?;
+        Some((user, self.password.as_deref().unwrap_or("")))
+    }
+}
+
+impl fmt::Debug for ProxyEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxyEndpoint")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+pub(crate) fn authority(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+#[derive(Debug)]
+pub enum ProxyError {
+    Direct(io::Error),
+    Unreachable { proxy: String, source: io::Error },
+    Rejected { target: String, status: String },
+    Socks { detail: String },
+    Protocol { proxy: String, detail: String },
+    Timeout { proxy: String },
+}
+
+impl fmt::Display for ProxyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Direct(e) => write!(f, "{e}"),
+            Self::Unreachable { proxy, source } => write!(f, "Proxy {proxy} unreachable: {source}"),
+            Self::Rejected { target, status } => {
+                write!(f, "Proxy rejected CONNECT to {target}: {status}")
+            }
+            Self::Socks { detail } => write!(f, "SOCKS5 proxy refused: {detail}"),
+            Self::Protocol { proxy, detail } => write!(f, "Proxy {proxy}: {detail}"),
+            Self::Timeout { proxy } => write!(f, "Proxy {proxy} did not answer in time"),
+        }
+    }
+}
+
+impl std::error::Error for ProxyError {}
+
+impl ProxyError {
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Direct(e) | Self::Unreachable { source: e, .. } => is_transient_io_kind(e.kind()),
+            _ => false,
+        }
+    }
+}
+
+pub(crate) fn is_transient_io_kind(kind: io::ErrorKind) -> bool {
+    use io::ErrorKind::*;
+    matches!(
+        kind,
+        ConnectionReset
+            | ConnectionAborted
+            | ConnectionRefused
+            | TimedOut
+            | BrokenPipe
+            | UnexpectedEof
+    )
+}

@@ -1,0 +1,2121 @@
+use crate::error::{AppError, ErrorCode};
+use crate::knock::{self, KnockError, KnockSpec};
+use crate::known_hosts::{ConflictPrompt, KnownHostsStore, PendingConflicts};
+use crate::proxy::{self, ProxyError, ProxySpec};
+use crate::terminal_output::SessionApp;
+use russh::client::{self, AuthResult, KeyboardInteractiveAuthResponse, Prompt};
+use russh::keys::ssh_key::HashAlg;
+use russh::keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate};
+use russh::{MethodKind, MethodSet};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JumpHostConnect {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub password: Option<String>,
+    pub private_key: Option<String>,
+    pub passphrase: Option<String>,
+    /// This hop's own Legacy Algorithms: the target's does not weaken the hops before it.
+    #[serde(default)]
+    pub legacy_algorithms: bool,
+}
+
+// By hand, so a log line or a panic message never carries the hop's login.
+impl std::fmt::Debug for JumpHostConnect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "JumpHostConnect({}@{}:{})", self.username, self.host, self.port)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SshStep {
+    Knocking,
+    TcpConnected,
+    Handshake,
+    Authenticating,
+    OpeningShell,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SshStepEvent {
+    pub step: SshStep,
+    pub detail: String,
+}
+
+/// `new_interactive`'s return: the handler plus the shared slot `connect`
+/// needs after the handshake (the server's SSH banner for Windows detection).
+type InteractiveClient = (SshClient, Arc<Mutex<Option<Vec<u8>>>>);
+
+pub struct SshClient {
+    host: String,
+    port: u16,
+    known_hosts: Arc<KnownHostsStore>,
+    conflict_prompt: Option<ConflictPrompt>,
+    /// Server's SSH identification banner, captured in `kex_done`. Read after
+    /// the handshake to detect Windows OpenSSH (see `platform_from_sshid`).
+    remote_sshid: Arc<Mutex<Option<Vec<u8>>>>,
+    /// Whether this connection requested agent forwarding; gates the server's
+    /// agent channels (see `open_agent_channel`).
+    agent_forwarding: bool,
+}
+
+impl SshClient {
+    /// Non-interactive constructor (exec commands, SFTP, jump hosts).
+    pub fn new(host: String, port: u16, known_hosts: Arc<KnownHostsStore>) -> Self {
+        Self {
+            host,
+            port,
+            known_hosts,
+            conflict_prompt: None,
+            remote_sshid: Arc::new(Mutex::new(None)),
+            agent_forwarding: false,
+        }
+    }
+
+    /// Interactive constructor for the final SSH session. Beyond the handler it
+    /// hands back the remote SSH banner slot (`kex_done` fills it; `connect`
+    /// reads it to detect Windows).
+    pub fn new_interactive(
+        host: String,
+        port: u16,
+        known_hosts: Arc<KnownHostsStore>,
+        app: impl SessionApp,
+        session_id: String,
+        pending_conflicts: Arc<PendingConflicts>,
+        agent_forwarding: bool,
+    ) -> InteractiveClient {
+        let client = Self {
+            conflict_prompt: Some(ConflictPrompt::via_app(
+                app,
+                "ssh-host-key-conflict",
+                session_id,
+                pending_conflicts,
+            )),
+            agent_forwarding,
+            ..Self::new(host, port, known_hosts)
+        };
+        let remote_sshid = Arc::clone(&client.remote_sshid);
+        (client, remote_sshid)
+    }
+}
+
+impl client::Handler for SshClient {
+    type Error = HopError;
+
+    // Capture the server's SSH identification banner once key exchange completes
+    // (before we open the shell) so `connect` can detect Windows OpenSSH and
+    // pick a shell path it can actually run.
+    async fn kex_done(
+        &mut self,
+        _shared_secret: Option<&[u8]>,
+        _names: &russh::Names,
+        session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        *self.remote_sshid.lock().await = Some(session.remote_sshid().to_vec());
+        Ok(())
+    }
+
+    async fn check_server_key(
+        &mut self,
+        server_key: &PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        // Host certificates are never advertised, so one arriving is unexpected: fail closed.
+        let PublicKeyOrCertificate::PublicKey {
+            key: server_public_key,
+            ..
+        } = server_key
+        else {
+            return Ok(false);
+        };
+        let fp = server_public_key.fingerprint(HashAlg::Sha256).to_string();
+
+        self.known_hosts
+            .verify_or_prompt(&self.host, self.port, fp, self.conflict_prompt.as_ref())
+            .await
+            .map(|()| true)
+            .map_err(HopError::HostKey)
+    }
+
+    // No remote forward is ever requested; russh's default would accept the channel.
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _connected_address: &str,
+        _connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        channel: russh::Channel<russh::client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        open_agent_channel(self.agent_forwarding, channel, reply).await;
+        Ok(())
+    }
+
+    // Nothing here asks a server to open any other channel, and russh's defaults would accept each: a
+    // session, a direct-tcpip or a socket a server opens towards this Mac, and X11, are all refused.
+    async fn server_channel_open_session(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        refuse(reply).await
+    }
+
+    async fn server_channel_open_direct_tcpip(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _host_to_connect: &str,
+        _port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        refuse(reply).await
+    }
+
+    async fn server_channel_open_direct_streamlocal(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _socket_path: &str,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        refuse(reply).await
+    }
+
+    async fn server_channel_open_forwarded_streamlocal(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _socket_path: &str,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        refuse(reply).await
+    }
+
+    async fn server_channel_open_x11(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        refuse(reply).await
+    }
+}
+
+async fn refuse(reply: client::ChannelOpenHandle) -> Result<(), HopError> {
+    reply
+        .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+        .await;
+    Ok(())
+}
+
+/// Only a connection that asked for agent forwarding may reach the local agent;
+/// jump hosts, SFTP/exec connections and forwarding-off sessions are refused.
+async fn open_agent_channel(
+    enabled: bool,
+    channel: russh::Channel<client::Msg>,
+    reply: client::ChannelOpenHandle,
+) {
+    if !enabled {
+        reply
+            .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
+        return;
+    }
+    match connect_local_agent().await {
+        Ok(agent) => {
+            reply.accept().await;
+            tokio::spawn(crate::port_forward::pipe::pump(
+                channel,
+                agent,
+                tokio_util::sync::CancellationToken::new(),
+                Default::default(),
+            ));
+        }
+        Err(_) => reply.reject(russh::ChannelOpenFailure::ConnectFailed).await,
+    }
+}
+
+#[cfg(unix)]
+async fn connect_local_agent() -> std::io::Result<tokio::net::UnixStream> {
+    let path = std::env::var_os("SSH_AUTH_SOCK").ok_or(std::io::ErrorKind::NotFound)?;
+    tokio::net::UnixStream::connect(path).await
+}
+
+#[cfg(windows)]
+async fn connect_local_agent() -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient>
+{
+    tokio::net::windows::named_pipe::ClientOptions::new().open(r"\\.\pipe\openssh-ssh-agent")
+}
+
+pub struct ConnectedSession {
+    pub handle: std::sync::Arc<client::Handle<SshClient>>,
+    pub input_tx: tokio::sync::mpsc::Sender<SessionInput>,
+    pub shutdown_tx: tokio::sync::mpsc::Sender<()>,
+    /// If true, closing this session only stops the channel I/O loop;
+    /// it does NOT disconnect the parent SSH handle (used for multiplexed exec sessions).
+    pub channel_only: bool,
+    /// True when the remote shell was wrapped in a persistent multiplexer
+    /// (tmux/screen). A user-initiated disconnect kills that session.
+    pub persist: bool,
+    /// Keeps intermediate jump-host SSH handles alive for the lifetime of this session.
+    pub _jump_handles: Vec<Arc<client::Handle<SshClient>>>,
+    /// Prefix putting a command on the machine this shell is on (`pct exec <vmid> --` in an LXC tab).
+    pub machine: Option<String>,
+    pub platform: Option<&'static str>,
+}
+
+pub(crate) fn spawn_exec(
+    handle: Arc<client::Handle<SshClient>>,
+    cmd: String,
+    limit: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        if let Ok(channel) = handle.channel_open_session().await {
+            let _ = exec_collect(channel, &cmd, limit).await;
+        }
+    });
+}
+
+/// Runs `cmd` on `channel` and collects stdout; `None` if the exec request fails,
+/// otherwise the output and whether it reached EOF within `limit`.
+pub(crate) async fn exec_collect(
+    channel: russh::Channel<client::Msg>,
+    cmd: &str,
+    limit: std::time::Duration,
+) -> Option<(Vec<u8>, bool)> {
+    channel.exec(true, cmd).await.ok()?;
+    Some(crate::ssh::exec::collect_stdout(channel, limit).await)
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum PersistentSession {
+    Present,
+    Gone,
+    /// Neither tmux nor screen on the host: the session ran as a plain shell.
+    NoMultiplexer,
+}
+
+impl PersistentSession {
+    fn from_probe(out: &str) -> Self {
+        if out.contains("SOLTZ_PRESENT") {
+            Self::Present
+        } else if out.contains("SOLTZ_NOMUX") {
+            Self::NoMultiplexer
+        } else {
+            Self::Gone
+        }
+    }
+
+    /// Nothing left on the host to attach back to.
+    pub(crate) fn ended(&self) -> bool {
+        *self != Self::Present
+    }
+}
+
+/// `None` when the probe is inconclusive (channel failure, timeout).
+pub(crate) async fn persistent_session_state(
+    handle: &client::Handle<SshClient>,
+    key: &str,
+) -> Option<PersistentSession> {
+    let probe = crate::shell_integration::persistent_probe_command(key);
+    let channel = handle.channel_open_session().await.ok()?;
+    let (out, completed) = exec_collect(channel, &probe, std::time::Duration::from_secs(5)).await?;
+    completed.then(|| PersistentSession::from_probe(&String::from_utf8_lossy(&out)))
+}
+
+pub enum SessionInput {
+    Data(Vec<u8>),
+    Resize(u32, u32),
+    Colors(crate::ssh::control_mode::TerminalColors),
+    PauseOutput(bool),
+}
+
+fn emit_step(app: &impl SessionApp, session_id: &str, step: SshStep, detail: impl Into<String>) {
+    app.emit(
+        &format!("ssh-step-{}", session_id),
+        SshStepEvent {
+            step,
+            detail: detail.into(),
+        },
+    );
+}
+
+/// A server that never answers a userauth request would otherwise leave the UI on
+/// "Authenticating" forever — every other blocking step here is already bounded.
+const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Pick the RSA signature hash from what the server advertised in `server-sig-algs`
+/// (RFC 8308). `Some(inner)` means the server listed its algorithms and `inner` is
+/// authoritative — including `None`, which is an explicit "ssh-rsa only", not a guess.
+/// The outer `None` means the server said nothing at all, so we try the modern hash
+/// and let the caller retry ssh-rsa if it's refused.
+fn choose_rsa_hash(reported: Option<Option<HashAlg>>) -> Option<HashAlg> {
+    reported.unwrap_or(Some(HashAlg::Sha256))
+}
+
+const KEY_REJECTED: &str = "Public key authentication rejected.";
+const PASSWORD_REJECTED: &str =
+    "Password authentication rejected — check the username and password.";
+const KBD_INT_REJECTED: &str =
+    "Keyboard-interactive authentication rejected — check the username and password.";
+const KBD_INT_MAX_ROUNDS: usize = 8;
+
+fn auth_err(e: russh::Error) -> AppError {
+    AppError::caused("Auth failed", &e)
+}
+
+fn kbd_int_rejected() -> AppError {
+    AppError::coded(ErrorCode::SshPasswordRejected, KBD_INT_REJECTED)
+}
+
+/// `None` on success, otherwise the methods the server still accepts.
+fn rejected(res: AuthResult) -> Option<MethodSet> {
+    match res {
+        AuthResult::Success => None,
+        AuthResult::Failure {
+            remaining_methods, ..
+        } => Some(remaining_methods),
+    }
+}
+
+const PASSWORD_EXPIRED: &str =
+    "The server requires a new password — sign in once from a terminal and change it there.";
+const PASSWORD_WORDS: &[&str] = &[
+    "password",
+    "passwort",
+    "mot de passe",
+    "пароль",
+    "parola",
+    "şifre",
+    "密码",
+    "heslo",
+];
+// PAM's expired-password flow re-asks the current password before the new one.
+const PASSWORD_CHANGE_WORDS: &[&str] = &[
+    "new ",
+    "retype",
+    "again",
+    "confirm",
+    "current",
+    "change",
+    "expired",
+    "neu",
+    "aktuell",
+    "nouveau",
+    "actuel",
+    "нов",
+    "текущ",
+    "смен",
+    "yeni",
+    "mevcut",
+    "新",
+    "当前",
+    "nové",
+    "současné",
+];
+
+enum PromptKind {
+    Password,
+    PasswordChange,
+    Other,
+}
+
+fn classify_prompt(p: &Prompt) -> PromptKind {
+    let text = p.prompt.to_lowercase();
+    if p.echo || !PASSWORD_WORDS.iter().any(|w| text.contains(w)) {
+        PromptKind::Other
+    } else if PASSWORD_CHANGE_WORDS.iter().any(|w| text.contains(w)) {
+        PromptKind::PasswordChange
+    } else {
+        PromptKind::Password
+    }
+}
+
+// Only password prompts get an answer, and only once: being asked again means it was wrong.
+fn answer_prompts(
+    prompts: &[Prompt],
+    password: &str,
+    sent: &mut bool,
+) -> Result<Vec<String>, AppError> {
+    prompts
+        .iter()
+        .map(|p| match classify_prompt(p) {
+            PromptKind::Other => {
+                let asked = p.prompt.trim();
+                Err(AppError::coded(
+                    ErrorCode::SshPromptUnanswerable,
+                    format!("The server asked \"{asked}\", which can't be answered automatically."),
+                )
+                .with_param("prompt", asked))
+            }
+            PromptKind::PasswordChange => Err(AppError::coded(
+                ErrorCode::SshPasswordExpired,
+                PASSWORD_EXPIRED,
+            )),
+            PromptKind::Password if std::mem::replace(sent, true) => Err(kbd_int_rejected()),
+            PromptKind::Password => Ok(password.to_owned()),
+        })
+        .collect()
+}
+
+async fn authenticate_key<H: client::Handler>(
+    handle: &mut client::Handle<H>,
+    username: &str,
+    key_str: &str,
+    passphrase: Option<&str>,
+) -> Result<AuthResult, AppError> {
+    let key_pair = Arc::new(
+        russh::keys::decode_secret_key(key_str, passphrase)
+            .map_err(|e| format!("Invalid private key: {}", e))?,
+    );
+    let is_rsa = matches!(key_pair.algorithm(), russh::keys::Algorithm::Rsa { .. });
+
+    // Only RSA has a choice of signature hash. Ask the server which it accepts
+    // (`server-sig-algs`, RFC 8308) instead of assuming: dropbear before
+    // 2020.79 — still shipping on plenty of OpenWrt routers — only supports
+    // ssh-rsa, and rejects the rsa-sha2-256 we used to send unconditionally.
+    let reported = match is_rsa {
+        true => handle.best_supported_rsa_hash().await.ok().flatten(),
+        false => None,
+    };
+    let hash = is_rsa.then(|| choose_rsa_hash(reported)).flatten();
+
+    let mut res = handle
+        .authenticate_publickey(username, PrivateKeyWithHashAlg::new(key_pair.clone(), hash))
+        .await
+        .map_err(auth_err)?;
+
+    // A server too old to advertise `server-sig-algs` is also too old to accept
+    // rsa-sha2-*. Retrying costs one round trip and only on an already-failed auth.
+    // A server that did list its algorithms and still refused the key gets no SHA-1 signature from it.
+    if !res.success() && is_rsa && reported.is_none() {
+        res = handle
+            .authenticate_publickey(username, PrivateKeyWithHashAlg::new(key_pair, None))
+            .await
+            .map_err(auth_err)?;
+    }
+    Ok(res)
+}
+
+// What `ssh` falls back to on `PasswordAuthentication no` + `UsePAM yes` (FreeBSD's default).
+async fn authenticate_keyboard_interactive<H: client::Handler>(
+    handle: &mut client::Handle<H>,
+    username: &str,
+    password: &str,
+) -> Result<(), AppError> {
+    let mut reply = handle
+        .authenticate_keyboard_interactive_start(username, None::<String>)
+        .await
+        .map_err(auth_err)?;
+    let mut sent = false;
+    for _ in 0..KBD_INT_MAX_ROUNDS {
+        let prompts = match reply {
+            KeyboardInteractiveAuthResponse::Success => return Ok(()),
+            KeyboardInteractiveAuthResponse::Failure { .. } => return Err(kbd_int_rejected()),
+            KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => prompts,
+        };
+        let answers = answer_prompts(&prompts, password, &mut sent)?;
+        reply = handle
+            .authenticate_keyboard_interactive_respond(answers)
+            .await
+            .map_err(auth_err)?;
+    }
+    Err("Keyboard-interactive authentication gave up: the server kept prompting.".into())
+}
+
+/// Key, then password, or keyboard-interactive with the same password when the
+/// server has no `password` method. Like `ssh`, a "none" request lists them first.
+async fn authenticate_handle_inner<H: client::Handler>(
+    handle: &mut client::Handle<H>,
+    username: &str,
+    password: Option<&str>,
+    private_key: Option<&str>,
+    passphrase: Option<&str>,
+) -> Result<(), AppError> {
+    if password.is_none() && private_key.is_none() {
+        return Err("No authentication method provided".into());
+    }
+    let Some(mut remaining) = rejected(handle.authenticate_none(username).await.map_err(auth_err)?)
+    else {
+        return Ok(());
+    };
+    let mut key_rejected = false;
+
+    if let Some(key) = private_key.filter(|_| remaining.contains(&MethodKind::PublicKey)) {
+        let Some(m) = rejected(authenticate_key(handle, username, key, passphrase).await?) else {
+            return Ok(());
+        };
+        (remaining, key_rejected) = (m, true);
+    }
+    if let Some(pwd) = password {
+        // A password rejected here would fail keyboard-interactive too; trying both
+        // doubles the failures fail2ban/sshguard count against the host.
+        if remaining.contains(&MethodKind::Password) {
+            let res = handle
+                .authenticate_password(username, pwd)
+                .await
+                .map_err(auth_err)?;
+            return if res.success() {
+                Ok(())
+            } else {
+                Err(AppError::coded(
+                    ErrorCode::SshPasswordRejected,
+                    PASSWORD_REJECTED,
+                ))
+            };
+        }
+        if remaining.contains(&MethodKind::KeyboardInteractive) {
+            return authenticate_keyboard_interactive(handle, username, pwd).await;
+        }
+    }
+
+    if key_rejected {
+        return Err(AppError::coded(ErrorCode::SshKeyRejected, KEY_REJECTED));
+    }
+    let accepted = remaining
+        .iter()
+        .map(<&str>::from)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(AppError::coded(
+        ErrorCode::SshNoUsableAuthMethod,
+        format!("No usable authentication method — the server only accepts: {accepted}."),
+    )
+    .with_param("methods", accepted))
+}
+
+pub async fn authenticate_handle<H: client::Handler>(
+    handle: &mut client::Handle<H>,
+    username: &str,
+    password: Option<&str>,
+    private_key: Option<&str>,
+    passphrase: Option<&str>,
+) -> Result<(), AppError> {
+    tokio::time::timeout(
+        AUTH_TIMEOUT,
+        authenticate_handle_inner(handle, username, password, private_key, passphrase),
+    )
+    .await
+    .map_err(|_| {
+        let seconds = AUTH_TIMEOUT.as_secs();
+        AppError::coded(
+            ErrorCode::SshAuthTimeout,
+            format!(
+                "Authentication timed out after {seconds}s — the server accepted the connection \
+                 but never answered the authentication request. Some older SSH servers stall \
+                 here; try the host's \"Legacy algorithms\" option, or another authentication \
+                 method."
+            ),
+        )
+        .with_param("seconds", seconds)
+    })?
+}
+
+// Retry transient connect failures: busy/throttling sshd often RSTs new connections.
+const CONNECT_MAX_ATTEMPTS: u32 = 3;
+const CONNECT_RETRY_BACKOFF_MS: u64 = 300;
+
+/// Platforms with no POSIX shell, named by their banner whatever the login shell:
+/// `SSH-2.0-OpenSSH_for_Windows_9.5`, MikroTik's `SSH-2.0-ROSSSH`.
+pub(crate) fn platform_from_sshid(sshid: &[u8]) -> Option<&'static str> {
+    let id = String::from_utf8_lossy(sshid).to_ascii_lowercase();
+    if id.contains("windows") {
+        Some("windows")
+    } else if id.contains("rosssh") {
+        Some("routeros")
+    } else {
+        None
+    }
+}
+
+async fn platform_of(sshid: &Mutex<Option<Vec<u8>>>) -> Option<&'static str> {
+    sshid.lock().await.as_deref().and_then(platform_from_sshid)
+}
+
+fn is_transient_connect_error(e: &russh::Error) -> bool {
+    match e {
+        russh::Error::IO(io) => proxy::is_transient_io_kind(io.kind()),
+        russh::Error::HUP | russh::Error::ConnectionTimeout => true,
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HopRoute {
+    pub proxy: Option<ProxySpec>,
+    pub knock: Option<KnockSpec>,
+}
+
+#[derive(Debug)]
+pub enum HopError {
+    Knock(KnockError),
+    AfterKnock(Box<HopError>),
+    Proxy(ProxyError),
+    Ssh(russh::Error),
+    /// Shown verbatim and never retried; the frontend matches on its text.
+    HostKey(String),
+}
+
+impl From<russh::Error> for HopError {
+    fn from(e: russh::Error) -> Self {
+        Self::Ssh(e)
+    }
+}
+
+impl std::fmt::Display for HopError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Knock(e) => write!(f, "{e}"),
+            Self::AfterKnock(e) => write!(f, "{e} (after port knock)"),
+            Self::Proxy(e) => write!(f, "{e}"),
+            Self::Ssh(e) => write!(f, "{e}"),
+            Self::HostKey(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl HopError {
+    fn is_transient(&self) -> bool {
+        match self {
+            Self::Knock(_) => false,
+            Self::AfterKnock(e) => e.is_transient(),
+            Self::Proxy(e) => e.is_transient(),
+            Self::Ssh(e) => is_transient_connect_error(e),
+            Self::HostKey(_) => false,
+        }
+    }
+
+    /// The error for the user: a host-key verdict as is, any other failure as
+    /// `<context>: <error>`, coded after its cause (refused, unreachable…).
+    pub(crate) fn describe(self, context: &str) -> AppError {
+        match self {
+            Self::HostKey(reason) => AppError::Msg(reason),
+            Self::AfterKnock(inner) if matches!(*inner, Self::HostKey(_)) => {
+                inner.describe(context)
+            }
+            e => AppError::caused(context, &e),
+        }
+    }
+}
+
+/// The returned `Option<String>` is the proxy's `via` label.
+pub(crate) async fn connect_first_hop<H>(
+    config: Arc<client::Config>,
+    route: &HopRoute,
+    host: &str,
+    port: u16,
+    handler: H,
+) -> Result<(client::Handle<H>, Option<String>), HopError>
+where
+    H: client::Handler + Send + 'static,
+    H::Error: Into<HopError>,
+{
+    if let Some(spec) = &route.knock {
+        knock::knock(spec, route.proxy.as_ref(), host, port)
+            .await
+            .map_err(HopError::Knock)?;
+    }
+    let after = |e: HopError| {
+        if route.knock.is_some() {
+            HopError::AfterKnock(Box::new(e))
+        } else {
+            e
+        }
+    };
+    let dialed = proxy::dial(route.proxy.as_ref(), host, port)
+        .await
+        .map_err(|e| after(HopError::Proxy(e)))?;
+    let handle = client::connect_stream(config, dialed.stream, handler)
+        .await
+        .map_err(|e| after(e.into()))?;
+    Ok((handle, dialed.via))
+}
+
+pub(crate) fn hop_detail(host: &str, port: u16, suffix: &str, via: Option<&str>) -> String {
+    match via {
+        Some(v) => format!("{host}:{port}{suffix} via {v}"),
+        None => format!("{host}:{port}{suffix}"),
+    }
+}
+
+/// The handler is rebuilt each attempt because `connect_stream` consumes it.
+pub(crate) async fn connect_first_hop_retrying<H, T>(
+    config: &Arc<client::Config>,
+    route: &HopRoute,
+    host: &str,
+    port: u16,
+    max_attempts: u32,
+    mut make: impl FnMut() -> (H, T),
+) -> Result<(client::Handle<H>, Option<String>, T), HopError>
+where
+    H: client::Handler + Send + 'static,
+    H::Error: Into<HopError>,
+{
+    let mut attempt = 1;
+    loop {
+        let (handler, extra) = make();
+        match connect_first_hop(Arc::clone(config), route, host, port, handler).await {
+            Ok((h, via)) => return Ok((h, via, extra)),
+            Err(e) if attempt < max_attempts && e.is_transient() => {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    CONNECT_RETRY_BACKOFF_MS * attempt as u64,
+                ))
+                .await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// What a jump hop checks host keys against, and how it asks about one it has not seen or that changed
+/// (`None`: such a hop is refused).
+pub(crate) struct HopTrust<'a> {
+    pub known_hosts: &'a Arc<KnownHostsStore>,
+    pub ask: Option<&'a (dyn Fn() -> ConflictPrompt + Send + Sync)>,
+}
+
+impl HopTrust<'_> {
+    fn client(&self, host: &str, port: u16) -> SshClient {
+        SshClient {
+            conflict_prompt: self.ask.map(|ask| ask()),
+            ..SshClient::new(host.into(), port, Arc::clone(self.known_hosts))
+        }
+    }
+}
+
+pub(crate) async fn connect_first_hop_plain(
+    config: &Arc<client::Config>,
+    route: &HopRoute,
+    trust: &HopTrust<'_>,
+    host: &str,
+    port: u16,
+    max_attempts: u32,
+) -> Result<(client::Handle<SshClient>, Option<String>), HopError> {
+    let (h, via, ()) = connect_first_hop_retrying(config, route, host, port, max_attempts, || {
+        (trust.client(host, port), ())
+    })
+    .await?;
+    Ok((h, via))
+}
+
+/// Opens a direct-tcpip channel through `via` and runs `handler`'s handshake over it.
+pub(crate) async fn tunnel_hop(
+    via: &client::Handle<SshClient>,
+    config: &Arc<client::Config>,
+    role: &str,
+    handler: SshClient,
+) -> Result<client::Handle<SshClient>, AppError> {
+    let (host, port) = (handler.host.clone(), handler.port);
+    let channel = via
+        .channel_open_direct_tcpip(host.as_str(), port as u32, "127.0.0.1", 0)
+        .await
+        .map_err(|e| AppError::caused(format!("Failed to open tunnel to {role} {host}"), &e))?;
+    client::connect_stream(Arc::clone(config), channel.into_stream(), handler)
+        .await
+        .map_err(|e| e.describe(&format!("SSH handshake with {role} {host} failed")))
+}
+
+/// Hops from `first` through each of `jumps`, returning the last hop and the handles it rides on.
+pub(crate) async fn chain_jumps(
+    first: client::Handle<SshClient>,
+    jumps: &[JumpHostConnect],
+    config: impl Fn(&JumpHostConnect) -> Arc<client::Config>,
+    trust: &HopTrust<'_>,
+    mut reached: impl FnMut(String),
+) -> Result<
+    (
+        client::Handle<SshClient>,
+        Vec<Arc<client::Handle<SshClient>>>,
+    ),
+    AppError,
+> {
+    let mut current = first;
+    let mut passed = Vec::new();
+    for (i, jump) in jumps.iter().enumerate() {
+        let next = jump.reach_through(&current, &config(jump), trust).await?;
+        passed.push(Arc::new(std::mem::replace(&mut current, next)));
+        reached(format!("{}:{} (jump {})", jump.host, jump.port, i + 2));
+    }
+    Ok((current, passed))
+}
+
+impl JumpHostConnect {
+    pub(crate) async fn connect_first(
+        &self,
+        config: &Arc<client::Config>,
+        route: &HopRoute,
+        trust: &HopTrust<'_>,
+        max_attempts: u32,
+    ) -> Result<(client::Handle<SshClient>, Option<String>), AppError> {
+        connect_first_hop_plain(
+            config,
+            route,
+            trust,
+            &self.host,
+            self.port,
+            max_attempts,
+        )
+        .await
+        .map_err(|e| self.failed(e.describe(&format!("Jump host {} connection failed", self.host))))
+    }
+
+    /// Names this hop beside the code, so the translation says which machine failed.
+    fn failed(&self, e: AppError) -> AppError {
+        e.with_param("jumpHost", &self.host)
+    }
+
+    pub(crate) async fn authenticate(
+        &self,
+        handle: &mut client::Handle<SshClient>,
+    ) -> Result<(), String> {
+        authenticate_handle(
+            handle,
+            &self.username,
+            self.password.as_deref(),
+            self.private_key.as_deref(),
+            self.passphrase.as_deref(),
+        )
+        .await
+        .map_err(|e| format!("Jump host {} auth failed: {e}", self.host))
+    }
+
+    pub(crate) async fn reach_through(
+        &self,
+        via: &client::Handle<SshClient>,
+        config: &Arc<client::Config>,
+        trust: &HopTrust<'_>,
+    ) -> Result<client::Handle<SshClient>, AppError> {
+        let handler = trust.client(&self.host, self.port);
+        let mut handle = tunnel_hop(via, config, "jump host", handler)
+            .await
+            .map_err(|e| self.failed(e))?;
+        self.authenticate(&mut handle).await?;
+        Ok(handle)
+    }
+}
+
+pub async fn connect(
+    app: impl SessionApp,
+    session_id: String,
+    host: &str,
+    port: u16,
+    username: &str,
+    password: Option<&str>,
+    private_key: Option<&str>,
+    passphrase: Option<&str>,
+    jump_hosts: Vec<JumpHostConnect>,
+    env_vars: Vec<(String, String)>,
+    agent_forwarding: bool,
+    pre_command: Option<String>,
+    shell_integration: bool,
+    known_hosts: Arc<KnownHostsStore>,
+    pending_conflicts: Arc<PendingConflicts>,
+    keepalive_interval_secs: u64,
+    keepalive_max: usize,
+    persist: bool,
+    restore: bool,
+    attach_only: bool,
+    pty_cols: u32,
+    pty_rows: u32,
+    legacy_algorithms: bool,
+    initial_cwd: Option<String>,
+    route: HopRoute,
+    terminal_colors: Option<crate::ssh::control_mode::TerminalColors>,
+    detached_ttl_secs: Option<u64>,
+) -> Result<ConnectedSession, AppError> {
+    let terminal_colors =
+        terminal_colors.filter(crate::ssh::control_mode::TerminalColors::is_valid);
+    let config = Arc::new(client_config(
+        keepalive_interval_secs,
+        keepalive_max,
+        legacy_algorithms,
+    ));
+
+    // Build the chain: jump_hosts[0] → jump_hosts[1] → ... → final host
+    // Each hop opens a direct-tcpip channel to the next host, layering SSH over it.
+    let mut jump_handles: Vec<Arc<client::Handle<SshClient>>> = Vec::new();
+
+    #[allow(unused_assignments)]
+    let mut final_sshid: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+
+    if let Some(spec) = &route.knock {
+        emit_step(
+            &app,
+            &session_id,
+            SshStep::Knocking,
+            spec.steps.len().to_string(),
+        );
+    }
+
+    let mut final_handle: client::Handle<SshClient> = if jump_hosts.is_empty() {
+        let (h, via, sshid) =
+            connect_first_hop_retrying(&config, &route, host, port, CONNECT_MAX_ATTEMPTS, || {
+                SshClient::new_interactive(
+                    host.to_string(),
+                    port,
+                    Arc::clone(&known_hosts),
+                    app.clone(),
+                    session_id.clone(),
+                    Arc::clone(&pending_conflicts),
+                    agent_forwarding,
+                )
+            })
+            .await
+            .map_err(|e| e.describe("Connection failed"))?;
+        final_sshid = sshid;
+        emit_step(
+            &app,
+            &session_id,
+            SshStep::TcpConnected,
+            hop_detail(host, port, "", via.as_deref()),
+        );
+        h
+    } else {
+        let first = &jump_hosts[0];
+        // A jump host's key is asked about through the same session as the final host's.
+        let ask = || {
+            ConflictPrompt::via_app(
+                app.clone(),
+                "ssh-host-key-conflict",
+                session_id.clone(),
+                Arc::clone(&pending_conflicts),
+            )
+        };
+        let trust = HopTrust {
+            known_hosts: &known_hosts,
+            ask: Some(&ask),
+        };
+        let hop_config = |jump: &JumpHostConnect| {
+            Arc::new(client_config(
+                keepalive_interval_secs,
+                keepalive_max,
+                jump.legacy_algorithms,
+            ))
+        };
+        let (mut current_handle, via) = first
+            .connect_first(&hop_config(first), &route, &trust, CONNECT_MAX_ATTEMPTS)
+            .await?;
+        emit_step(
+            &app,
+            &session_id,
+            SshStep::TcpConnected,
+            hop_detail(&first.host, first.port, " (jump 1)", via.as_deref()),
+        );
+        first.authenticate(&mut current_handle).await?;
+        let (current_handle, passed) = chain_jumps(
+            current_handle,
+            &jump_hosts[1..],
+            hop_config,
+            &trust,
+            |detail| emit_step(&app, &session_id, SshStep::TcpConnected, detail),
+        )
+        .await?;
+        jump_handles.extend(passed);
+
+        let (final_client, sshid) = SshClient::new_interactive(
+            host.to_string(),
+            port,
+            Arc::clone(&known_hosts),
+            app.clone(),
+            session_id.clone(),
+            Arc::clone(&pending_conflicts),
+            agent_forwarding,
+        );
+        final_sshid = sshid;
+        let h = tunnel_hop(&current_handle, &config, "final host", final_client).await?;
+
+        jump_handles.push(Arc::new(current_handle));
+        emit_step(
+            &app,
+            &session_id,
+            SshStep::TcpConnected,
+            format!("{}:{}", host, port),
+        );
+        h
+    };
+
+    // Key exchange is done by russh internally during connect()
+    emit_step(
+        &app,
+        &session_id,
+        SshStep::Handshake,
+        "Negotiating encryption",
+    );
+
+    // Authentication on the final host
+    emit_step(
+        &app,
+        &session_id,
+        SshStep::Authenticating,
+        format!("as {}", username),
+    );
+    authenticate_handle(
+        &mut final_handle,
+        username,
+        password,
+        private_key,
+        passphrase,
+    )
+    .await?;
+
+    // The bootstraps and env injection below are POSIX shell; without one they leave a blank terminal.
+    let platform = platform_of(&final_sshid).await;
+    let posix_shell = platform.is_none();
+    let shell_integration = shell_integration && posix_shell;
+    let persist = persist && posix_shell;
+    let restore = restore && posix_shell;
+
+    // Attach-only (reconnect/join): verify the multiplexer session still exists
+    // before attaching — attaching never creates, so a dead session must fail
+    // fast with the stable SESSION_ENDED error the frontend tears down on. An
+    // inconclusive probe (timeout, channel failure) falls through to the attach,
+    // whose own guard exits if the session is truly gone.
+    let mut attach_only = attach_only;
+    if persist && attach_only {
+        let key = crate::shell_integration::tmux_session_key(&session_id);
+        match persistent_session_state(&final_handle, &key).await {
+            Some(PersistentSession::Gone) => return Err("SESSION_ENDED".into()),
+            // A host without tmux/screen never had anything to attach to: reconnect
+            // with a fresh shell, as a non-persistent session does.
+            Some(PersistentSession::NoMultiplexer) => attach_only = false,
+            _ => {}
+        }
+    }
+
+    // Open channel + shell
+    emit_step(&app, &session_id, SshStep::OpeningShell, "Requesting PTY");
+
+    let channel = final_handle
+        .channel_open_session()
+        .await
+        .map_err(|e| format!("Failed to open channel: {}", e))?;
+
+    channel
+        .request_pty(false, "xterm-256color", pty_cols, pty_rows, 0, 0, &[])
+        .await
+        .map_err(|e| format!("PTY request failed: {}", e))?;
+
+    if agent_forwarding {
+        channel
+            .agent_forward(false)
+            .await
+            .map_err(|e| format!("Agent forwarding request failed: {}", e))?;
+    }
+
+    // Workspace restore of a persistent session: replay the multiplexer's
+    // scrollback history (tmux or screen) into the frontend terminal BEFORE the
+    // attach below redraws the live screen. Runs on its own exec channel;
+    // ordering is guaranteed because the shell channel hasn't been exec'd yet.
+    // If the multiplexer or session is gone (host rebooted), the capture is
+    // empty and we skip.
+    if restore && persist {
+        let key = crate::shell_integration::tmux_session_key(&session_id);
+        let capture = crate::shell_integration::capture_history_command(&key, pty_rows);
+        if let Ok(cap_channel) = final_handle.channel_open_session().await {
+            if let Some((history, _)) =
+                exec_collect(cap_channel, &capture, std::time::Duration::from_secs(5)).await
+            {
+                if !history.iter().all(|b| b.is_ascii_whitespace())
+                    && !history
+                        .starts_with(crate::shell_integration::CONTROL_MODE_MARKER.as_bytes())
+                {
+                    // capture-pane emits bare LF; the PTY-less exec channel
+                    // does no ONLCR translation, so normalize for xterm.
+                    let mut out: Vec<u8> =
+                        Vec::with_capacity(history.len() + (pty_rows as usize) * 2);
+                    for b in history {
+                        if b == b'\n' {
+                            out.push(b'\r');
+                        }
+                        out.push(b);
+                    }
+                    // Scroll the history fully into xterm's scrollback so the
+                    // attach redraw below paints a clean viewport.
+                    for _ in 0..pty_rows {
+                        out.extend_from_slice(b"\r\n");
+                    }
+                    crate::terminal_output::emit_output(&app, &session_id, &out);
+                }
+            }
+        }
+    }
+
+    // `cd` into the starting directory from inside the exec'd command rather than
+    // by writing to the shell's stdin: no line in the scrollback, no entry in the
+    // shell's history, and no race with the shell (or the multiplexer) coming up.
+    // The persistent wrappers embed their inner command in a double-quoted
+    // assignment, so a path the outer shell would expand is dropped rather than
+    // mangled — the session then just starts in the default directory.
+    let cd_prefix = initial_cwd
+        // Control characters too: this path came from the terminal's output (OSC 7), and typed into a
+        // shell below, a ^U would erase the `cd '` before it and leave the rest as a command.
+        .filter(|p| {
+            !p.is_empty() && !p.contains(['"', '$', '`', '\\']) && !p.chars().any(char::is_control)
+        })
+        .map(|p| format!("cd {} 2>/dev/null; ", crate::ssh::exec::shell_quote(&p)))
+        .unwrap_or_default();
+
+    // When shell integration is enabled we replace the standard shell channel
+    // request with an exec of our wrapper script. The wrapper detects the
+    // remote $SHELL and execs into it with OSC 7 emission already hooked
+    // (writes a temp rcfile under /tmp). Falling back to request_shell keeps
+    // the historical behavior available via the setting.
+    let exec_cmd = if shell_integration {
+        let inner = crate::shell_integration::ssh_exec_command(&cd_prefix);
+        Some(if persist {
+            let key = crate::shell_integration::tmux_session_key(&session_id);
+            if attach_only {
+                crate::shell_integration::persistent_attach_command(&key)
+            } else {
+                crate::shell_integration::persistent_exec_command(&key, &inner)
+            }
+        } else {
+            inner
+        })
+    } else if persist {
+        // Persistence without shell integration: bare login shell. `inner` must
+        // have no double quotes (embedded in the multiplexer's quoted command),
+        // so SHELL is left unquoted. MOTD runs inside the inner so tmux's redraw
+        // on attach doesn't wipe it.
+        let key = crate::shell_integration::tmux_session_key(&session_id);
+        let inner = format!(
+            "{}{}; exec ${{SHELL:-/bin/sh}} -l",
+            cd_prefix,
+            crate::shell_integration::MOTD_PREAMBLE
+        );
+        Some(if attach_only {
+            crate::shell_integration::persistent_attach_command(&key)
+        } else {
+            crate::shell_integration::persistent_exec_command(&key, &inner)
+        })
+    } else {
+        None
+    };
+
+    // dropbear aborts the whole connection with "String too long" once an SSH
+    // string passes its 9000-byte MAX_STRING_LEN, which reads as a hang right
+    // after authentication rather than an error (#85). Servers that small are
+    // better served by a plain shell than by a session that never opens.
+    let exec_cmd = exec_cmd.filter(|c| c.len() <= crate::shell_integration::MAX_EXEC_COMMAND_LEN);
+    // A plain `request_shell` has nowhere to carry the prefix, so it goes in over
+    // stdin below instead.
+    let cd_over_stdin = exec_cmd.is_none() && !cd_prefix.is_empty();
+    let wrapped = persist && exec_cmd.is_some();
+    match exec_cmd {
+        Some(cmd) => channel
+            .exec(false, cmd.as_bytes())
+            .await
+            .map_err(|e| format!("Shell exec failed: {}", e))?,
+        None => channel
+            .request_shell(false)
+            .await
+            .map_err(|e| format!("Shell request failed: {}", e))?,
+    }
+
+    let (read_half, write_half) = channel.split();
+
+    let mut startup = String::new();
+    if posix_shell {
+        startup.push_str(&crate::ssh::env_handoff::startup_input(&final_handle, &env_vars).await);
+        // Before pre_command: a host command that changes directory itself must win.
+        if cd_over_stdin {
+            startup.push_str(&format!("{}\n", cd_prefix.trim_end()));
+        }
+    }
+    if let Some(cmd) = pre_command {
+        startup.push_str(&format!("{}\n", cmd));
+    }
+
+    let handle = Arc::new(final_handle);
+
+    let control = if wrapped {
+        crate::ssh::control_mode::ControlSession::new(
+            crate::shell_integration::tmux_session_key(&session_id),
+            pty_cols,
+            pty_rows,
+            terminal_colors.clone(),
+        )
+    } else {
+        crate::ssh::control_mode::ControlSession::raw()
+    };
+    let osc7_seen = control.osc7_flag();
+
+    // Multiplexers keep the shell's OSC 7 for themselves (control mode passes it
+    // through once the shell emits one), so poll the pane's cwd until then.
+    if persist {
+        let poll_handle = Arc::clone(&handle);
+        let poll_app = app.clone();
+        let key = crate::shell_integration::tmux_session_key(&session_id);
+        spawn_exec(
+            Arc::clone(&handle),
+            crate::shell_integration::persistent_legacy_setup_command(
+                &key,
+                terminal_colors.as_ref(),
+            ),
+            std::time::Duration::from_secs(30),
+        );
+        spawn_exec(
+            Arc::clone(&handle),
+            crate::shell_integration::persistent_ttl_command(&key, detached_ttl_secs),
+            std::time::Duration::from_secs(30),
+        );
+        let cwd_cmd = crate::shell_integration::cwd_probe_command(&key);
+        let cwd_event = format!("ssh-cwd-{}", session_id);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+            let mut last: Option<String> = None;
+            let mut failures = 0u32;
+            loop {
+                interval.tick().await;
+                if osc7_seen.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                // The session handle is explicitly disconnected on teardown, so
+                // a run of failed channel opens means it's gone — stop polling.
+                let channel = match poll_handle.channel_open_session().await {
+                    Ok(c) => c,
+                    Err(_) => {
+                        failures += 1;
+                        if failures >= 3 {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                failures = 0;
+                let Some((out, _)) =
+                    exec_collect(channel, &cwd_cmd, std::time::Duration::from_secs(3)).await
+                else {
+                    continue;
+                };
+                let path = String::from_utf8_lossy(&out).trim().to_string();
+                if crate::shell_integration::is_live_probe_cwd(&path)
+                    && Some(&path) != last.as_ref()
+                {
+                    poll_app.emit(&cwd_event, path.clone());
+                    last = Some(path);
+                }
+            }
+        });
+    }
+
+    let io = crate::ssh::channel_io::spawn_channel_io_split(
+        app,
+        &session_id,
+        read_half,
+        write_half,
+        control,
+        wrapped.then(|| {
+            (
+                Arc::clone(&handle),
+                crate::shell_integration::tmux_session_key(&session_id),
+            )
+        }),
+    );
+    if !startup.is_empty() {
+        let _ = io
+            .input_tx
+            .send(SessionInput::Data(startup.into_bytes()))
+            .await;
+    }
+
+    Ok(ConnectedSession {
+        handle,
+        input_tx: io.input_tx,
+        shutdown_tx: io.shutdown_tx,
+        channel_only: false,
+        persist,
+        _jump_handles: jump_handles,
+        machine: None,
+        platform,
+    })
+}
+
+/// `keepalive_interval_secs == 0` disables keepalive.
+pub fn client_config(
+    keepalive_interval_secs: u64,
+    keepalive_max: usize,
+    legacy_algorithms: bool,
+) -> client::Config {
+    client::Config {
+        keepalive_interval: (keepalive_interval_secs > 0)
+            .then(|| std::time::Duration::from_secs(keepalive_interval_secs)),
+        keepalive_max,
+        preferred: if legacy_algorithms {
+            legacy_preferred()
+        } else {
+            default_preferred()
+        },
+        ..Default::default()
+    }
+}
+
+/// russh's defaults without `ssh-rsa` host-key signatures (RSA with SHA-1), which OpenSSH has refused
+/// since 8.8; a host that old gets them back with Legacy Algorithms.
+fn default_preferred() -> russh::Preferred {
+    let base = russh::Preferred::DEFAULT;
+    let sha1 = |a: &russh::keys::Algorithm| matches!(a, russh::keys::Algorithm::Rsa { hash: None });
+    russh::Preferred {
+        key: base.key.iter().filter(|a| !sha1(a)).cloned().collect::<Vec<_>>().into(),
+        ..base
+    }
+}
+
+/// A one-shot connection and the platform its banner names.
+pub type Authenticated = (client::Handle<SshClient>, Option<&'static str>);
+
+/// One-shot connect + auth for headless commands (no PTY, no jump hosts).
+pub async fn connect_authenticated(
+    known_hosts: Arc<KnownHostsStore>,
+    host: &str,
+    port: u16,
+    username: &str,
+    password: Option<&str>,
+    private_key: Option<&str>,
+    passphrase: Option<&str>,
+    legacy_algorithms: bool,
+    route: &HopRoute,
+) -> Result<Authenticated, String> {
+    let config = Arc::new(client_config(
+        0,
+        client::Config::default().keepalive_max,
+        legacy_algorithms,
+    ));
+    let (mut handle, _via, sshid) =
+        connect_first_hop_retrying(&config, route, host, port, 1, || {
+            let c = SshClient::new(host.into(), port, Arc::clone(&known_hosts));
+            let sshid = Arc::clone(&c.remote_sshid);
+            (c, sshid)
+        })
+        .await
+        .map_err(|e| e.describe("Connection failed"))?;
+    authenticate_handle(&mut handle, username, password, private_key, passphrase).await?;
+    Ok((handle, platform_of(&sshid).await))
+}
+
+/// russh's safe defaults plus legacy/weak algorithms appended (OpenSSH `+algo`
+/// semantics): strong algorithms still negotiate first, but old devices — e.g.
+/// legacy Cisco IOS that only offers `diffie-hellman-group1-sha1` / `3des-cbc`
+/// / `hmac-sha1` — can still connect. `ssh-rsa` host keys are already accepted
+/// by russh's default, so only kex/cipher/mac need extending here.
+fn legacy_preferred() -> russh::Preferred {
+    use russh::{cipher, kex, mac};
+
+    let base = russh::Preferred::DEFAULT;
+
+    // None of these are present in russh's safe defaults, so plain appends keep
+    // the secure-first ordering without duplicates.
+    let mut kex_algos = base.kex.to_vec();
+    kex_algos.extend([kex::DH_GEX_SHA1, kex::DH_G14_SHA1, kex::DH_G1_SHA1]);
+
+    let mut ciphers = base.cipher.to_vec();
+    ciphers.extend([
+        cipher::AES_256_CBC,
+        cipher::AES_192_CBC,
+        cipher::AES_128_CBC,
+        cipher::TRIPLE_DES_CBC,
+    ]);
+
+    let mut macs = base.mac.to_vec();
+    macs.extend([mac::HMAC_SHA1_ETM, mac::HMAC_SHA1]);
+
+    russh::Preferred {
+        kex: kex_algos.into(),
+        cipher: ciphers.into(),
+        mac: macs.into(),
+        key: base.key,
+        host_key_certificates: base.host_key_certificates,
+        compression: base.compression,
+    }
+}
+
+/// Whether turning on legacy algorithms would give `kind` a match among `theirs`.
+pub(crate) fn legacy_algorithms_match(kind: &russh::AlgorithmKind, theirs: &[String]) -> bool {
+    use russh::AlgorithmKind as K;
+    let legacy = legacy_preferred();
+    let ours: Vec<&str> = match kind {
+        K::Kex => legacy.kex.iter().map(AsRef::as_ref).collect(),
+        K::Cipher => legacy.cipher.iter().map(AsRef::as_ref).collect(),
+        K::Mac => legacy.mac.iter().map(AsRef::as_ref).collect(),
+        K::Key | K::Compression => return false,
+    };
+    theirs.iter().any(|t| ours.contains(&t.as_str()))
+}
+
+/// `theirs` without the protocol markers a KEX list carries beside real algorithms.
+pub(crate) fn offered_algorithms(theirs: &[String]) -> String {
+    use russh::kex;
+    let markers = [
+        kex::EXTENSION_SUPPORT_AS_CLIENT,
+        kex::EXTENSION_SUPPORT_AS_SERVER,
+        kex::EXTENSION_OPENSSH_STRICT_KEX_AS_CLIENT,
+        kex::EXTENSION_OPENSSH_STRICT_KEX_AS_SERVER,
+    ];
+    theirs
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !markers.iter().any(|m| m.as_ref() == *name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        answer_prompts, authenticate_handle, choose_rsa_hash, client, client_config,
+        connect_first_hop_retrying, legacy_algorithms_match, legacy_preferred, open_agent_channel,
+        platform_from_sshid, Arc, HopError, HopRoute, PersistentSession, SshClient, AUTH_TIMEOUT,
+        KBD_INT_REJECTED, KEY_REJECTED, PASSWORD_EXPIRED, PASSWORD_REJECTED,
+    };
+
+    #[test]
+    fn a_host_without_a_multiplexer_is_not_a_gone_session() {
+        assert_eq!(
+            PersistentSession::from_probe("SOLTZ_PRESENT"),
+            PersistentSession::Present
+        );
+        assert_eq!(PersistentSession::from_probe(""), PersistentSession::Gone);
+        assert_eq!(
+            PersistentSession::from_probe("SOLTZ_NOMUX"),
+            PersistentSession::NoMultiplexer
+        );
+        assert!(!PersistentSession::Present.ended());
+        assert!(PersistentSession::Gone.ended());
+        assert!(PersistentSession::NoMultiplexer.ended());
+    }
+    use crate::error::{AppError, ErrorCode};
+    use crate::known_hosts::KnownHostsStore;
+    use russh::client::Prompt;
+    use russh::keys::ssh_key::HashAlg;
+    use russh::server::{Auth, Response};
+    use russh::MethodKind::{self, KeyboardInteractive, Password, PublicKey};
+    use std::borrow::Cow;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const SECRET: &str = "s3cret";
+
+    fn prompt(text: &str, echo: bool) -> Prompt {
+        Prompt {
+            prompt: text.into(),
+            echo,
+        }
+    }
+
+    /// A failure as the frontend sees it: its code and English message.
+    fn wire<T>(r: Result<T, AppError>) -> Result<T, (Option<ErrorCode>, String)> {
+        r.map_err(|e| (e.code(), e.to_string()))
+    }
+
+    #[test]
+    fn only_password_prompts_are_answered_once() {
+        for text in [
+            "Password:",
+            "Password for root@fbsd:",
+            "Parola:",
+            "Mot de passe :",
+            "Пароль:",
+            "密码：",
+            "Heslo:",
+        ] {
+            let got = answer_prompts(&[prompt(text, false)], SECRET, &mut false);
+            assert_eq!(wire(got), Ok(vec![SECRET.to_string()]), "{text}");
+        }
+        for text in [
+            "You are required to change your password immediately (administrator enforced).\n\
+             Changing password for bob.\nCurrent password: ",
+            "(current) UNIX password:",
+            "New password:",
+            "Retype new password:",
+            "Nouveau mot de passe :",
+            "Новый пароль:",
+            "Yeni parola:",
+            "Nové heslo:",
+        ] {
+            let got = answer_prompts(&[prompt(text, false)], SECRET, &mut false);
+            let expired = (Some(ErrorCode::SshPasswordExpired), PASSWORD_EXPIRED.into());
+            assert_eq!(wire(got), Err(expired), "{text}");
+        }
+        for p in [
+            prompt("Verification code:", false),
+            prompt("Password:", true),
+        ] {
+            let asked = p.prompt.to_string();
+            let err = answer_prompts(&[p], SECRET, &mut false).unwrap_err();
+            assert!(err.to_string().contains("can't be answered"), "{err}");
+            let json = serde_json::to_value(&err).unwrap();
+            assert_eq!(json["code"], "ssh-prompt-unanswerable");
+            assert_eq!(json["params"]["prompt"], asked.trim());
+        }
+        let again = answer_prompts(&[prompt("Password:", false)], SECRET, &mut true);
+        let rejected = (
+            Some(ErrorCode::SshPasswordRejected),
+            KBD_INT_REJECTED.into(),
+        );
+        assert_eq!(wire(again), Err(rejected));
+        assert_eq!(wire(answer_prompts(&[], SECRET, &mut false)), Ok(vec![]));
+    }
+
+    /// Like sshd: a disabled method always fails, and every rejection relists the enabled ones.
+    struct AuthServer {
+        methods: &'static [MethodKind],
+        kbd_prompt: &'static str,
+        accept_key: bool,
+    }
+
+    impl AuthServer {
+        fn decide(&self, method: MethodKind, ok: bool) -> Auth {
+            if ok && self.methods.contains(&method) {
+                return Auth::Accept;
+            }
+            Auth::Reject {
+                proceed_with_methods: Some(self.methods.into()),
+                partial_success: false,
+            }
+        }
+    }
+
+    impl russh::server::Handler for AuthServer {
+        type Error = russh::Error;
+
+        async fn auth_password(&mut self, _: &str, password: &str) -> Result<Auth, Self::Error> {
+            Ok(self.decide(Password, password == SECRET))
+        }
+
+        async fn auth_publickey(
+            &mut self,
+            _: &str,
+            _: russh::server::VerifiedPublicKey<'_>,
+        ) -> Result<Auth, Self::Error> {
+            Ok(self.decide(PublicKey, self.accept_key))
+        }
+
+        async fn auth_keyboard_interactive<'a>(
+            &'a mut self,
+            _: &str,
+            _: &str,
+            response: Option<Response<'a>>,
+        ) -> Result<Auth, Self::Error> {
+            Ok(match response {
+                None if self.methods.contains(&KeyboardInteractive) => Auth::Partial {
+                    name: Cow::Borrowed(""),
+                    instructions: Cow::Borrowed(""),
+                    prompts: Cow::Owned(vec![(Cow::Borrowed(self.kbd_prompt), false)]),
+                },
+                None => self.decide(KeyboardInteractive, false),
+                Some(mut r) => self.decide(
+                    KeyboardInteractive,
+                    r.next().as_deref() == Some(SECRET.as_bytes()),
+                ),
+            })
+        }
+    }
+
+    async fn auth(
+        server: AuthServer,
+        password: Option<&str>,
+        key: Option<&str>,
+    ) -> Result<(), AppError> {
+        use crate::port_forward::test_ssh::{serve_one, TestClient};
+        let config = russh::server::Config {
+            methods: server.methods.into(),
+            auth_rejection_time: std::time::Duration::ZERO,
+            auth_rejection_time_initial: Some(std::time::Duration::ZERO),
+            ..Default::default()
+        };
+        let port = serve_one(config, server).await;
+        let addr = ("127.0.0.1", port);
+        let mut handle = russh::client::connect(Default::default(), addr, TestClient)
+            .await
+            .unwrap();
+        authenticate_handle(&mut handle, "root", password, key, None).await
+    }
+
+    #[tokio::test]
+    async fn auth_falls_back_key_password_keyboard_interactive() {
+        let key: russh::keys::PrivateKey =
+            russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[7; 32]).into();
+        let key = key
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap();
+        let key = Some(key.as_str());
+        // FreeBSD: UsePAM yes, PasswordAuthentication no, KbdInteractiveAuthentication yes.
+        const PAM: &[MethodKind] = &[PublicKey, KeyboardInteractive];
+        const ALL: &[MethodKind] = &[PublicKey, Password, KeyboardInteractive];
+        const PWD: &[MethodKind] = &[Password];
+        const KEY: &[MethodKind] = &[PublicKey];
+        const PW: &str = "Password for root@fbsd:";
+        const OTP: &str = "Verification code:";
+        let (ok, bad) = (Some(SECRET), Some("wrong"));
+        let otp = "The server asked \"Verification code:\", which can't be answered automatically.";
+        let no_method = "No usable authentication method — the server only accepts: publickey.";
+
+        use ErrorCode::{
+            SshKeyRejected, SshNoUsableAuthMethod, SshPasswordRejected, SshPromptUnanswerable,
+        };
+
+        let cases = [
+            (PAM, PW, false, ok, None, Ok(())),
+            (
+                PAM,
+                PW,
+                false,
+                bad,
+                None,
+                Err((SshPasswordRejected, KBD_INT_REJECTED)),
+            ),
+            (PAM, PW, false, ok, key, Ok(())),
+            (PAM, OTP, false, ok, None, Err((SshPromptUnanswerable, otp))),
+            (PWD, PW, false, ok, None, Ok(())),
+            (
+                PWD,
+                PW,
+                false,
+                bad,
+                None,
+                Err((SshPasswordRejected, PASSWORD_REJECTED)),
+            ),
+            (ALL, PW, false, ok, None, Ok(())),
+            (
+                ALL,
+                PW,
+                false,
+                bad,
+                None,
+                Err((SshPasswordRejected, PASSWORD_REJECTED)),
+            ),
+            (KEY, PW, true, None, key, Ok(())),
+            (
+                KEY,
+                PW,
+                false,
+                None,
+                key,
+                Err((SshKeyRejected, KEY_REJECTED)),
+            ),
+            (
+                KEY,
+                PW,
+                false,
+                ok,
+                None,
+                Err((SshNoUsableAuthMethod, no_method)),
+            ),
+        ];
+        for (i, (methods, kbd_prompt, accept_key, password, key, want)) in
+            cases.into_iter().enumerate()
+        {
+            let server = AuthServer {
+                methods,
+                kbd_prompt,
+                accept_key,
+            };
+            assert_eq!(
+                wire(auth(server, password, key).await),
+                want.map_err(|(code, msg)| (Some(code), msg.to_string())),
+                "case {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_advertised_rsa_hash_is_honoured() {
+        assert_eq!(
+            choose_rsa_hash(Some(Some(HashAlg::Sha512))),
+            Some(HashAlg::Sha512)
+        );
+        assert_eq!(
+            choose_rsa_hash(Some(Some(HashAlg::Sha256))),
+            Some(HashAlg::Sha256)
+        );
+    }
+
+    #[test]
+    fn server_without_rsa_sha2_gets_ssh_rsa() {
+        // dropbear < 2020.79 lists its algorithms without any rsa-sha2-*. Sending
+        // rsa-sha2-256 there rejects a key the server would otherwise accept.
+        assert_eq!(choose_rsa_hash(Some(None)), None);
+    }
+
+    #[test]
+    fn silent_server_gets_sha256_then_falls_back() {
+        // No server-sig-algs at all: optimistic, with the caller's ssh-rsa retry behind it.
+        assert_eq!(choose_rsa_hash(None), Some(HashAlg::Sha256));
+    }
+
+    #[test]
+    fn auth_timeout_is_bounded() {
+        // The bug this guards: an unanswered userauth left the UI spinning forever.
+        assert!(AUTH_TIMEOUT.as_secs() > 0 && AUTH_TIMEOUT.as_secs() <= 60);
+    }
+
+    #[test]
+    fn platform_banners_are_detected() {
+        assert_eq!(
+            platform_from_sshid(b"SSH-2.0-OpenSSH_for_Windows_9.5"),
+            Some("windows")
+        );
+        assert_eq!(
+            platform_from_sshid(b"SSH-2.0-OpenSSH_for_Windows_8.1"),
+            Some("windows")
+        );
+        assert_eq!(
+            platform_from_sshid(b"SSH-2.0-Foo_WINDOWS_1.0"),
+            Some("windows")
+        );
+        assert_eq!(platform_from_sshid(b"SSH-2.0-ROSSSH"), Some("routeros"));
+    }
+
+    #[test]
+    fn posix_banners_have_no_platform() {
+        for id in [
+            &b"SSH-2.0-OpenSSH_9.6"[..],
+            b"SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.4",
+            b"SSH-2.0-dropbear_2022.83",
+            b"",
+        ] {
+            assert_eq!(platform_from_sshid(id), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_toggle_negotiates_with_sha1_only_server() {
+        use crate::port_forward::test_ssh::{connect_to_server, Behavior};
+        use russh::{cipher, kex, mac};
+        use std::borrow::Cow;
+
+        // No AEAD cipher, so the MAC actually has to negotiate.
+        let openssh_5_3 = || russh::Preferred {
+            kex: Cow::Borrowed(&[kex::DH_GEX_SHA256, kex::DH_G14_SHA1, kex::DH_G1_SHA1]),
+            cipher: Cow::Borrowed(&[
+                cipher::AES_128_CTR,
+                cipher::AES_256_CTR,
+                cipher::AES_128_CBC,
+                cipher::TRIPLE_DES_CBC,
+            ]),
+            mac: Cow::Borrowed(&[mac::HMAC_SHA1]),
+            ..Default::default()
+        };
+        let connect = |legacy| {
+            connect_to_server(
+                client_config(0, 3, legacy),
+                openssh_5_3(),
+                Behavior::GreetThenClose,
+            )
+        };
+        assert!(matches!(
+            connect(false).await,
+            Err(russh::Error::NoCommonAlgo {
+                kind: russh::AlgorithmKind::Mac,
+                ..
+            })
+        ));
+        assert!(connect(true).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn sha1_only_kex_names_the_legacy_toggle() {
+        use crate::error::{AppError, ErrorCode};
+        use crate::port_forward::test_ssh::{connect_to_server, Behavior};
+        use russh::kex;
+        use std::borrow::Cow;
+
+        let fiberhome_olt = russh::Preferred {
+            kex: Cow::Borrowed(&[
+                kex::DH_GEX_SHA1,
+                kex::DH_G14_SHA1,
+                kex::DH_G1_SHA1,
+                kex::EXTENSION_SUPPORT_AS_SERVER,
+                kex::EXTENSION_OPENSSH_STRICT_KEX_AS_SERVER,
+            ]),
+            ..Default::default()
+        };
+        let err = connect_to_server(
+            client_config(0, 3, false),
+            fiberhome_olt,
+            Behavior::GreetThenClose,
+        )
+        .await
+        .err()
+        .map(HopError::Ssh)
+        .expect("default algorithms must not negotiate");
+        let AppError::Coded { code, params, .. } = AppError::caused("Connection failed", &err)
+        else {
+            panic!("expected a coded error");
+        };
+        assert_eq!(code, ErrorCode::SshLegacyAlgorithmsRequired);
+        assert_eq!(
+            params.get("offered").map(String::as_str),
+            Some("diffie-hellman-group-exchange-sha1, diffie-hellman-group14-sha1, diffie-hellman-group1-sha1")
+        );
+    }
+
+    #[test]
+    fn unsupported_algorithms_are_not_blamed_on_the_legacy_toggle() {
+        let theirs = vec!["hmac-md5".to_string()];
+        assert!(!legacy_algorithms_match(
+            &russh::AlgorithmKind::Mac,
+            &theirs
+        ));
+        assert!(!legacy_algorithms_match(
+            &russh::AlgorithmKind::Key,
+            &["ssh-dss".to_string()]
+        ));
+        assert!(legacy_algorithms_match(
+            &russh::AlgorithmKind::Cipher,
+            &["3des-cbc".to_string()]
+        ));
+    }
+
+    #[test]
+    fn legacy_preferred_includes_weak_algorithms() {
+        let p = legacy_preferred();
+        let kex: Vec<&str> = p.kex.iter().map(|n| n.as_ref()).collect();
+        let cipher: Vec<&str> = p.cipher.iter().map(|n| n.as_ref()).collect();
+        let mac: Vec<&str> = p.mac.iter().map(|n| n.as_ref()).collect();
+
+        // The exact algorithms the legacy Cisco in issue #17 offers.
+        assert!(kex.contains(&"diffie-hellman-group1-sha1"));
+        assert!(cipher.contains(&"3des-cbc"));
+        assert!(mac.contains(&"hmac-sha1"));
+
+        // Strong defaults still negotiate first.
+        assert_eq!(kex.first().copied(), Some("mlkem768x25519-sha256"));
+        assert_eq!(
+            cipher.first().copied(),
+            Some("chacha20-poly1305@openssh.com")
+        );
+    }
+
+    /// Accepts anyone and relays each direct-tcpip channel to the TCP address it names.
+    struct Relay;
+
+    impl russh::server::Handler for Relay {
+        type Error = russh::Error;
+
+        async fn auth_none(&mut self, _: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn channel_open_direct_tcpip(
+            &mut self,
+            channel: russh::Channel<russh::server::Msg>,
+            host: &str,
+            port: u32,
+            _: &str,
+            _: u32,
+            reply: russh::server::ChannelOpenHandle,
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            let mut tcp = tokio::net::TcpStream::connect((host, port as u16)).await?;
+            reply.accept().await;
+            tokio::spawn(async move {
+                let _ = tokio::io::copy_bidirectional(&mut channel.into_stream(), &mut tcp).await;
+            });
+            Ok(())
+        }
+    }
+
+    fn served_key() -> String {
+        crate::port_forward::test_ssh::host_key()
+            .public_key()
+            .fingerprint(HashAlg::Sha256)
+            .to_string()
+    }
+
+    const WRONG_KEY: &str = "SHA256:not-the-servers-key";
+
+    fn host_key_warning(port: u16) -> String {
+        format!("WARNING: Host key changed for 127.0.0.1:{port}!")
+    }
+
+    #[tokio::test]
+    async fn a_changed_host_key_behind_a_jump_host_reaches_the_user_verbatim() {
+        let serve = || crate::port_forward::test_ssh::serve_one(Default::default(), Relay);
+        let (jump_port, target_port) = (serve().await, serve().await);
+        let known_hosts = Arc::new(KnownHostsStore::pinned(&[
+            ("127.0.0.1", jump_port, &served_key()),
+            ("127.0.0.1", target_port, WRONG_KEY),
+        ]));
+        let config = Arc::new(client::Config::default());
+        let jump = super::JumpHostConnect {
+            host: "127.0.0.1".into(),
+            port: jump_port,
+            username: "u".into(),
+            password: Some("p".into()),
+            private_key: None,
+            passphrase: None,
+        };
+        let (mut via, _) = jump
+            .connect_first(&config, &HopRoute::default(), &known_hosts, 1)
+            .await
+            .unwrap();
+        jump.authenticate(&mut via).await.unwrap();
+
+        let target = SshClient::new("127.0.0.1".into(), target_port, Arc::clone(&known_hosts));
+        let err = super::tunnel_hop(&via, &config, "final host", target)
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.to_string().starts_with(&host_key_warning(target_port)),
+            "{err}"
+        );
+        assert_eq!(err.code(), None);
+    }
+
+    /// Returns how many times `make` ran.
+    async fn count_attempts(
+        port: u16,
+        max_attempts: u32,
+        known_hosts: Arc<KnownHostsStore>,
+    ) -> (u32, Result<(), AppError>) {
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls2 = Arc::clone(&calls);
+        let result = connect_first_hop_retrying(
+            &Arc::new(client::Config::default()),
+            &HopRoute::default(),
+            "127.0.0.1",
+            port,
+            max_attempts,
+            move || {
+                calls2.fetch_add(1, Ordering::SeqCst);
+                let c = SshClient::new("127.0.0.1".into(), port, Arc::clone(&known_hosts));
+                (c, ())
+            },
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| e.describe("boom"));
+        (calls.load(Ordering::SeqCst), result)
+    }
+
+    fn closed_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    #[tokio::test]
+    async fn retrying_helper_retries_transient_failures_up_to_max_attempts() {
+        let port = closed_port();
+        let (calls, result) = count_attempts(port, 3, Arc::new(KnownHostsStore::new())).await;
+        assert_eq!(calls, 3);
+        let err = result.unwrap_err();
+        assert!(err.to_string().starts_with("boom: "), "{err}");
+        assert_eq!(err.code(), Some(ErrorCode::ConnectionRefused));
+    }
+
+    #[tokio::test]
+    async fn retrying_helper_does_not_retry_a_changed_host_key() {
+        let port = crate::port_forward::test_ssh::serve_one(Default::default(), Relay).await;
+        let known_hosts = Arc::new(KnownHostsStore::pinned(&[("127.0.0.1", port, WRONG_KEY)]));
+        let (calls, result) = count_attempts(port, 3, known_hosts).await;
+        assert_eq!(calls, 1);
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().starts_with(&host_key_warning(port)),
+            "{err}"
+        );
+        assert_eq!(err.code(), None);
+    }
+
+    #[tokio::test]
+    async fn retrying_helper_max_attempts_one_never_retries() {
+        let port = closed_port();
+        let (calls, _result) = count_attempts(port, 1, Arc::new(KnownHostsStore::new())).await;
+        assert_eq!(calls, 1);
+    }
+
+    /// Opens an agent channel back to the client as soon as it opens a session,
+    /// like a server that wants to use a forwarded agent.
+    struct AgentProbeServer(Option<tokio::sync::oneshot::Sender<bool>>);
+
+    impl russh::server::Handler for AgentProbeServer {
+        type Error = russh::Error;
+
+        async fn auth_none(&mut self, _: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _: russh::Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            let (handle, tx) = (session.handle(), self.0.take());
+            tokio::spawn(async move {
+                let opened = handle.channel_open_agent().await.is_ok();
+                tx.map(|tx| tx.send(opened));
+            });
+            Ok(())
+        }
+    }
+
+    struct AgentClient(bool);
+
+    impl russh::client::Handler for AgentClient {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _: &russh::keys::PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn server_channel_open_agent_forward(
+            &mut self,
+            channel: russh::Channel<russh::client::Msg>,
+            reply: russh::client::ChannelOpenHandle,
+            _: &mut russh::client::Session,
+        ) -> Result<(), Self::Error> {
+            open_agent_channel(self.0, channel, reply).await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_channels_are_refused_without_forwarding() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let port = crate::port_forward::test_ssh::serve_one(
+            Default::default(),
+            AgentProbeServer(Some(tx)),
+        )
+        .await;
+        let mut handle =
+            russh::client::connect(Default::default(), ("127.0.0.1", port), AgentClient(false))
+                .await
+                .unwrap();
+        assert!(handle.authenticate_none("root").await.unwrap().success());
+        let _session = handle.channel_open_session().await.unwrap();
+        let opened = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("server never heard back")
+            .unwrap();
+        assert!(!opened, "the local agent was handed to the server");
+    }
+}

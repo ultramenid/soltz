@@ -1,0 +1,17 @@
+{
+  "type": "soltz-user-data",
+  "version": 2,
+  "exported_at": "2026-09-01T00:00:00.000Z",
+  "sections": {
+    "vaults": {
+      "data": {
+        "personal": { "name": "Personal", "updatedAt": "2026-02-01T00:00:00.000Z" },
+        "v-team": { "name": "", "teamId": "team-1", "updatedAt": "2026-03-01T00:00:00.000Z" },
+        "v-old": { "name": "Old", "updatedAt": "2026-01-01T00:00:00.000Z", "deletedAt": "2026-04-01T00:00:00.000Z" },
+        "v-future": { "name": "Future", "updatedAt": "2026-10-01T00:00:00.000Z", "color": "#000" }
+      },
+      "updated_at": "2026-10-01T00:00:00.000Z"
+    },
+    "appSettings": { "data": { "locale": "en" }, "updated_at": "2026-01-01T00:00:00.000Z" }
+  }
+}

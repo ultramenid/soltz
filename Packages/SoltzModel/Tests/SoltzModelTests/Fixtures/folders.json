@@ -1,0 +1,37 @@
+[
+  {
+    "id": "folder-1",
+    "name": "Servers",
+    "created_at": "2026-01-01T00:00:00Z",
+    "parent_folder_id": "root",
+    "object_type": "connection",
+    "vault_id": "team",
+    "pinned": true,
+    "color": "#22c55e",
+    "icon": "lucide:house",
+    "updated_at": "2026-01-02T00:00:00Z",
+    "deleted_at": null,
+    "clocks": { "name": "2026-01-01T00:00:00Z", "host": "2026-01-02T00:00:00Z" }
+  },
+  {
+    "id": "folder-min",
+    "name": "Untyped",
+    "vault_ids": ["team"],
+    "created_at": "2025-01-01T00:00:00Z",
+    "updated_at": "2025-01-01T00:00:00Z",
+    "deleted_at": null,
+    "clocks": {}
+  },
+  {
+    "id": "folder-keys",
+    "name": "Keys",
+    "created_at": "2026-01-01T00:00:00Z",
+    "parent_folder_id": null,
+    "object_type": "keychain",
+    "vault_id": "personal",
+    "updated_at": "2026-05-01T00:00:00Z",
+    "deleted_at": "2026-05-01T00:00:00Z",
+    "clocks": { "__deleted__": "2026-05-01T00:00:00Z" },
+    "sort_order": 3
+  }
+]
