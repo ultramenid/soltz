@@ -1,7 +1,11 @@
+<p align="center"><img src="docs/icon.png" width="128" height="128" alt="The Soltz app icon"></p>
+
 # Soltz
 
 A native macOS SSH client: terminals and file transfer, nothing else. Free, no account. macOS 27 or later, Apple
 silicon.
+
+![Soltz: the sidebar of hosts, and one host's three terminals side by side in a tab](docs/screenshot.png)
 
 Soltz is a Swift rewrite of [Voltius](https://github.com/VoltiusApp/voltius): its Rust core is a trimmed, modified
 copy of that project's backend, and the app is a port of its frontend. Licensed under the GNU Affero General Public
